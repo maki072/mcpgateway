@@ -28,9 +28,9 @@ def totp(step):
 # fake ssh/scp: prints its arguments so we can assert on them
 open(f"{T}/fakessh", "w").write('#!/bin/sh\necho "ARGS: $@"\nexit 3\n'); os.chmod(f"{T}/fakessh", 0o755)
 cfg = {"listen": f"127.0.0.1:{PORT}", "public_url": BASE, "cert_file": f"{T}/c.pem", "key_file": f"{T}/k.pem",
-       "kb_dir": f"{T}/kb", "tmp_dir": f"{T}/tmp", "state_file": f"{T}/state.json", "auth_file": f"{T}/auth.json",
+       "kb_dir": f"{T}/kb", "kb_db": f"{T}/kb.db", "backup_dir": f"{T}/backup", "net_allow_cidrs": ["10.255.255.0/24"], "tmp_dir": f"{T}/tmp", "state_file": f"{T}/state.json", "auth_file": f"{T}/auth.json",
        "audit_log": f"{T}/audit.log", "known_hosts": f"{T}/kh", "ssh_bin": f"{T}/fakessh", "scp_bin": f"{T}/fakessh",
-       "api_cidrs": ["127.0.0.0/8"], "login_cidrs": ["127.0.0.0/8"],
+       "api_cidrs": ["127.0.0.0/8"], "login_cidrs": ["127.0.0.0/8"], "trusted_cidrs": ["127.0.0.0/8"], "trusted_skip_totp": False,
        "redirect_allow": ["https://claude.ai/api/mcp/auth_callback"], "allow_loopback": True,
        "hosts": {"pve": {"addr": "192.0.2.1", "desc": "test", "ro_user": "mcp-ro", "ro_key": "/k/ro", "rw_user": "root", "rw_key": "/k/rw"},
                  "ro": {"addr": "192.0.2.2", "desc": "ro only", "ro_user": "u", "ro_key": "/k/ro"}}}
@@ -115,27 +115,51 @@ try:
     check("notification -> 202", s == 202)
     s, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, A)
     names = [t["name"] for t in json.loads(b)["result"]["tools"]]
-    check("tools/list", {"fs_read", "fs_write", "ssh_exec", "ssh_upload", "ssh_download"} <= set(names), names)
+    check("tools/list: only combined tools", set(names) == {"kb", "fs", "ssh", "net", "status"}, names)
+    sz = len(json.dumps(json.loads(b)["result"]["tools"]))
+    check("tools/list payload under 9 KB", sz < 9000, sz)
+    s, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}, A)
+    check("instructions start with kb find", "kb op=find" in json.loads(b)["result"]["instructions"])
 
     e, t = call("fs_write", {"root": "kb", "path": "projects/home.md", "content": "v1", "mode": "create"}); check("kb create", not e, t)
     e, t = call("fs_write", {"root": "kb", "path": "projects/home.md", "content": "v1", "mode": "create"}); check("kb create twice fails", e)
     e, t = call("fs_write", {"root": "kb", "path": "projects/home.md", "content": "v2", "mode": "overwrite"}); check("kb overwrite", not e, t)
     e, t = call("fs_write", {"root": "kb", "path": "projects/home.md", "content": "+v3", "mode": "append"}); check("kb append", not e, t)
     e, t = call("fs_read", {"root": "kb", "path": "projects/home.md"}); check("kb read", t == "v2+v3", t)
-    e, t = call("fs_list", {"root": "kb", "path": ".", "depth": 3, "include_hidden": True}); check("history kept", ".history/projects__home.md." in t, t)
+    e, t = call("fs_list", {"root": "kb", "path": ".", "depth": 3, "include_hidden": True}); check("kb listed", "projects" in t, t)
+    e, t = call("kb_history", {"path": "projects/home.md"}); check("history kept (v1 and v2)", not e and t.count("id=") == 2, t)
     e, t = call("fs_search", {"root": "kb", "query": "V2"}); check("search", "home.md:1" in t, t)
     for bad in ["../x", "/etc/passwd", "a/../../x", ".history/x", "a\\b"]:
         e, t = call("fs_write", {"root": "kb", "path": bad, "content": "x", "mode": "create"}); check("path rejected: " + bad, e, t)
     e, t = call("fs_read", {"root": "kb", "path": "../../etc/passwd"}); check("read traversal rejected", e, t)
-    os.symlink("/etc", f"{T}/kb/link")
-    e, t = call("fs_read", {"root": "kb", "path": "link/passwd"}); check("symlink escape blocked", e, t)
-    e, t = call("fs_delete", {"root": "kb", "path": "projects/home.md"}); check("kb delete", not e and ".trash" in t, t)
-    e, t = call("fs_list", {"root": "kb", "include_hidden": True, "depth": 3}); check("trash copy exists", ".trash/projects__home.md." in t, t)
+    os.makedirs(f"{T}/tmp", exist_ok=True); os.symlink("/etc", f"{T}/tmp/link")
+    e, t = call("fs_read", {"root": "tmp", "path": "link/passwd"}); check("tmp symlink escape blocked", e, t)
+    e, t = call("fs_delete", {"root": "kb", "path": "projects/home.md"}); check("kb delete", not e and "trash" in t, t)
+    e, t = call("kb_history", {"kind": "trash"}); check("trash copy exists", not e and "projects/home.md" in t, t)
     e, t = call("fs_write", {"root": "tmp", "path": "n.txt", "content": "tmp", "mode": "create"}); check("tmp write", not e, t)
     e, t = call("fs_move", {"root": "tmp", "from": "n.txt", "to": "d/m.txt"}); check("tmp move", not e, t)
 
+    # combined tools
+    doc = "---\ntitle: Big\nsummary: s\n---\n# Big\nintro\n## Alpha\nalpha text\n## Beta\nbeta text\n"
+    e, t = call("fs", {"op": "write", "root": "kb", "path": "p/x/card.md", "content": doc, "mode": "create"}); check("fs write (combined)", not e, t)
+    e, t = call("fs", {"op": "write", "root": "kb", "path": "p/x/docs/long.md", "content": doc, "mode": "create"}); check("fs write docs note", not e, t)
+    e, t = call("fs", {"op": "toc", "root": "kb", "path": "p/x/card.md"}); check("fs toc", not e and "L7 ## Alpha" in t and "## Beta" in t, t)
+    e, t = call("fs", {"op": "read", "root": "kb", "path": "p/x/card.md", "section": "beta"}); check("fs read section", not e and t == "## Beta\nbeta text\n", t)
+    e, t = call("fs", {"op": "read", "root": "kb", "path": "p/x/card.md", "section": "gamma"}); check("fs read missing section", e, t)
+    e, t = call("kb", {"op": "index", "path": "p"}); check("kb index hides docs/", not e and "p/x/card.md" in t and "long.md" not in t and "1 docs/ notes hidden" in t, t)
+    e, t = call("kb", {"op": "index", "path": "p", "include_docs": True}); check("kb index include_docs", not e and "long.md" in t, t)
+    e, t = call("kb", {"op": "find", "query": "alpha"}); check("kb find (combined)", not e and "p/x/card.md" in t, t)
+    e, t = call("kb", {"op": "nope"}); check("unknown op rejected with list", e and "find" in t, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "uptime", "grep": "StrictHost"}); check("ssh exec grep (combined)", not e and "StrictHostKeyChecking=yes" in t and "lines shown" not in t or "of" in t, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "uptime", "grep": "("}); check("ssh exec bad grep rejected", e, t)
+    e, t = call("ssh", {"op": "hosts"}); check("ssh hosts (combined)", not e and "pve" in t, t)
+    e, t = call("status", {"op": "server"}); check("status server", not e and "mcpgw" in t, t)
+    e, t = call("status", {"op": "audit", "lines": 3}); check("status audit", not e and t.count("\n") <= 3, t)
+    e, t = call("net", {"op": "dns", "name": "localhost"}); check("net dns routed", not e and "127.0.0.1" in t, t)
+    e, t = call("fs", {"op": "delete", "root": "kb", "path": "p/x/docs/long.md"}); check("fs delete (combined)", not e, t)
+    e, t = call("hosts_list"); check("legacy name still works", "pve" in t, t)
     e, t = call("hosts_list"); check("hosts_list", "pve" in t and "write=true" in t, t)
-    e, t = call("ssh_exec", {"host": "pve", "command": "uptime"}); check("ssh read uses ro user + hardened opts", "mcp-ro@192.0.2.1" in t and "StrictHostKeyChecking=yes" in t and "exit_code: 3" in t and "/k/ro" in t, t)
+    e, t = call("ssh_exec", {"host": "pve", "command": "uptime"}); check("ssh read uses ro user + hardened opts", "mcp-ro@192.0.2.1" in t and "StrictHostKeyChecking=yes" in t and "exit 3" in t and "/k/ro" in t, t)
     e, t = call("ssh_exec", {"host": "pve", "command": "touch /x", "mode": "write"}); check("write needs reason/backup", e, t)
     e, t = call("ssh_exec", {"host": "pve", "command": "systemctl restart xray", "mode": "write", "reason": "apply config change", "backup_note": "copied config to tmp"}); check("disruptive blocked", e and "disruptive" in t, t)
     e, t = call("ssh_exec", {"host": "pve", "command": "touch /x", "mode": "write", "reason": "create marker file", "backup_note": "file did not exist before"}); check("write ok uses rw user", not e and "root@192.0.2.1" in t and "/k/rw" in t, t)
@@ -157,6 +181,9 @@ try:
     # lockout: 5 failures lock the login
     s, _, page = req("GET", "/authorize?" + qs); rid = page.split('name="rid" value="')[1].split('"')[0]
     for _ in range(5): req("POST", "/authorize", form={"rid": rid, "pass": "bad", "totp": "111111"})
+    s, _, _ = req("POST", "/authorize", form={"rid": rid, "pass": PASS, "totp": totp(step + 2)})
+    check("spent login request after 5 tries", s == 400, s)
+    s, _, page = req("GET", "/authorize?" + qs); rid = page.split('name="rid" value="')[1].split('"')[0]
     s, _, _ = req("POST", "/authorize", form={"rid": rid, "pass": PASS, "totp": totp(step + 2)})
     check("lockout after repeated failures", s == 429, s)
 

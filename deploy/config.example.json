@@ -1,33 +1,46 @@
 {
-    "listen":  ":29443",
-    "public_url":  "https://mcp.example.com:29443",
-    "cert_file":  "/etc/mcpgw/tls/fullchain.pem",
-    "key_file":  "/etc/mcpgw/tls/privkey.pem",
-    "kb_dir":  "/srv/mcp/kb",
-    "tmp_dir":  "/srv/mcp/tmp",
-    "state_file":  "/var/lib/mcpgw/state.json",
-    "auth_file":  "/etc/mcpgw/auth.json",
-    "audit_log":  "/var/log/mcpgw/audit.log",
-    "known_hosts":  "/etc/mcpgw/known_hosts",
-    "api_cidrs":  [
-                      "203.0.113.0/24"
-                  ],
-    "login_cidrs":  [
-                        "192.168.1.0/24"
-                    ],
-    "redirect_allow":  [
-                           "https://claude.ai/api/mcp/auth_callback"
-                       ],
-    "allow_loopback":  false,
-    "hosts":  {
-                  "example":  {
-                                  "addr":  "192.0.2.10",
-                                  "port":  22,
-                                  "desc":  "example host",
-                                  "ro_user":  "mcp-ro",
-                                  "ro_key":  "/etc/mcpgw/keys/example_ro",
-                                  "rw_user":  "root",
-                                  "rw_key":  "/etc/mcpgw/keys/example_rw"
-                              }
-              }
+  "listen": ":29443",
+  "public_url": "https://mcp.example.com:29443",
+  "cert_file": "/etc/mcpgw/tls/fullchain.pem",
+  "key_file": "/etc/mcpgw/tls/privkey.pem",
+  "kb_dir": "/srv/mcp/kb",
+  "kb_db": "/var/lib/mcpgw/kb.db",
+  "backup_dir": "/srv/mcp/backup",
+  "tmp_dir": "/srv/mcp/tmp",
+  "state_file": "/var/lib/mcpgw/state.json",
+  "auth_file": "/etc/mcpgw/auth.json",
+  "audit_log": "/var/log/mcpgw/audit.log",
+  "known_hosts": "/etc/mcpgw/known_hosts",
+  "api_cidrs": [
+    "203.0.113.0/24",
+    "192.168.1.0/24"
+  ],
+  "login_cidrs": [
+    "0.0.0.0/0",
+    "::/0"
+  ],
+  "net_allow_cidrs": [
+    "192.168.1.0/24"
+  ],
+  "redirect_allow": [
+    "https://claude.ai/api/mcp/auth_callback"
+  ],
+  "allow_loopback": false,
+  "hosts": {
+    "example": {
+      "addr": "192.0.2.10",
+      "port": 22,
+      "desc": "example host",
+      "ro_user": "mcp-ro",
+      "ro_key": "/etc/mcpgw/keys/example_ro",
+      "rw_user": "root",
+      "rw_key": "/etc/mcpgw/keys/example_rw"
+    }
+  },
+  "trusted_cidrs": [
+    "192.168.1.0/24"
+  ],
+  "trusted_skip_totp": true,
+  "turnstile_sitekey": "0x4AAAAAAAexample",
+  "turnstile_secret_file": "/etc/mcpgw/turnstile.env"
 }

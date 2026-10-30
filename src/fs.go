@@ -24,16 +24,42 @@ const (
 
 // Auditor appends JSON lines; secrets are never passed to it.
 type Auditor struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	f    *os.File
+	path string
+	size int64
 }
+
+const (
+	auditMax  = 20 << 20 // rotate at 20 MiB
+	auditKeep = 3
+)
 
 func openAudit(p string) (*Auditor, error) {
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		return nil, err
 	}
-	return &Auditor{f: f}, nil
+	st, _ := f.Stat()
+	a := &Auditor{f: f, path: p}
+	if st != nil {
+		a.size = st.Size()
+	}
+	return a, nil
+}
+
+// rotateLocked shifts audit.log -> .1 -> .2 -> .3 and reopens a fresh file.
+func (a *Auditor) rotateLocked() {
+	_ = a.f.Close()
+	for i := auditKeep - 1; i >= 1; i-- {
+		_ = os.Rename(fmt.Sprintf("%s.%d", a.path, i), fmt.Sprintf("%s.%d", a.path, i+1))
+	}
+	_ = os.Rename(a.path, a.path+".1")
+	f, err := os.OpenFile(a.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil { // keep logging to the renamed file rather than losing events
+		f, _ = os.OpenFile(a.path+".1", os.O_APPEND|os.O_WRONLY, 0o640)
+	}
+	a.f, a.size = f, 0
 }
 
 func (a *Auditor) log(m map[string]any) {
@@ -41,28 +67,31 @@ func (a *Auditor) log(m map[string]any) {
 	b, _ := json.Marshal(m)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	_, _ = a.f.Write(append(b, '\n'))
+	if a.size > auditMax {
+		a.rotateLocked()
+	}
+	n, _ := a.f.Write(append(b, '\n'))
+	a.size += int64(n)
 }
 
 // FS provides traversal-safe access to two roots using os.Root:
 // "kb" (persistent notes, history kept on overwrite/delete) and "tmp" (scratch, auto-cleaned).
 type FS struct {
-	roots map[string]*os.Root
+	roots map[string]*os.Root // only "tmp" lives on disk
+	kb    *KBStore            // "kb" lives in SQLite
 	mu    sync.Mutex
 }
 
-func openFS(kb, tmp string) (*FS, error) {
-	f := &FS{roots: map[string]*os.Root{}}
-	for name, dir := range map[string]string{"kb": kb, "tmp": tmp} {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, err
-		}
-		r, err := os.OpenRoot(dir)
-		if err != nil {
-			return nil, err
-		}
-		f.roots[name] = r
+func openFS(kb *KBStore, tmp string) (*FS, error) {
+	f := &FS{roots: map[string]*os.Root{}, kb: kb}
+	if err := os.MkdirAll(tmp, 0o750); err != nil {
+		return nil, err
 	}
+	r, err := os.OpenRoot(tmp)
+	if err != nil {
+		return nil, err
+	}
+	f.roots["tmp"] = r
 	return f, nil
 }
 
@@ -72,6 +101,15 @@ func (f *FS) root(name string) (*os.Root, error) {
 		return nil, errors.New(`root must be "kb" or "tmp"`)
 	}
 	return r, nil
+}
+
+// kbRel validates a kb path; ok is false when root is not "kb".
+func (f *FS) kbRel(root, rel string) (string, bool, error) {
+	if root != "kb" {
+		return "", false, nil
+	}
+	rel, err := cleanRel(rel)
+	return rel, true, err
 }
 
 func cleanRel(p string) (string, error) {
@@ -114,6 +152,12 @@ type listEntry struct {
 }
 
 func (f *FS) list(root, rel string, depth int, hidden bool) ([]listEntry, error) {
+	if c, ok, err := f.kbRel(root, rel); ok {
+		if err != nil {
+			return nil, err
+		}
+		return f.kb.list(c, depth)
+	}
 	r, err := f.root(root)
 	if err != nil {
 		return nil, err
@@ -161,6 +205,12 @@ func (f *FS) list(root, rel string, depth int, hidden bool) ([]listEntry, error)
 }
 
 func (f *FS) read(root, rel string, off, n int64) (string, bool, error) {
+	if c, ok, err := f.kbRel(root, rel); ok {
+		if err != nil {
+			return "", false, err
+		}
+		return f.kb.read(c, off, n)
+	}
 	r, err := f.root(root)
 	if err != nil {
 		return "", false, err
@@ -240,6 +290,15 @@ func snapshot(r *os.Root, rel, dir string) error {
 }
 
 func (f *FS) write(root, rel, content, mode string) (string, error) {
+	if c, ok, err := f.kbRel(root, rel); ok {
+		if err != nil {
+			return "", err
+		}
+		if c == "." || reserved(c) {
+			return "", errors.New("invalid target path")
+		}
+		return f.kb.write(c, content, mode)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, err := f.root(root)
@@ -300,6 +359,15 @@ func (f *FS) write(root, rel, content, mode string) (string, error) {
 }
 
 func (f *FS) remove(root, rel string) (string, error) {
+	if c, ok, err := f.kbRel(root, rel); ok {
+		if err != nil {
+			return "", err
+		}
+		if c == "." || reserved(c) {
+			return "", errors.New("invalid target path")
+		}
+		return f.kb.remove(c)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, err := f.root(root)
@@ -331,6 +399,12 @@ func (f *FS) remove(root, rel string) (string, error) {
 }
 
 func (f *FS) search(root, rel, q string) ([]string, error) {
+	if c, ok, err := f.kbRel(root, rel); ok {
+		if err != nil {
+			return nil, err
+		}
+		return f.kb.search(c, q)
+	}
 	r, err := f.root(root)
 	if err != nil {
 		return nil, err

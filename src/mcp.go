@@ -53,6 +53,7 @@ func (a *App) routes() http.Handler {
 	m.HandleFunc("/token", a.gate(a.apiNets, a.token))
 	m.HandleFunc("/authorize", a.gate(a.loginNets, a.authorize))
 	m.HandleFunc("/mcp", a.gate(a.apiNets, a.mcp))
+	a.uiRoutes(m)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	return secure(m)
 }
@@ -131,7 +132,7 @@ func (a *App) dispatch(r *http.Request, cid string, q rpcReq) rpcResp {
 			"protocolVersion": pv,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"serverInfo":      map[string]any{"name": "mcpgw", "version": version},
-			"instructions":    "Home infrastructure gateway. Start with fs_read root=kb path=README.md. Use mode=read for inspection; mode=write requires reason and backup_note and a prior backup.",
+			"instructions":    instructions,
 		}
 	case "ping":
 		resp.Result = map[string]any{}
@@ -161,8 +162,8 @@ func (a *App) callTool(r *http.Request, cid string, params json.RawMessage) (any
 		return nil, &rpcErr{-32602, "invalid params"}
 	}
 	var t *tool
-	for _, c := range tools() {
-		if c.Name == p.Name {
+	for _, c := range append(tools(), legacyTools()...) {
+		if c.Name == p.Name && t == nil {
 			cc := c
 			t = &cc
 		}
@@ -203,24 +204,60 @@ func obj(props map[string]any, required ...string) map[string]any {
 
 func rootProp() map[string]any {
 	return map[string]any{"type": "string", "enum": []string{"kb", "tmp"},
-		"description": `"kb" = persistent knowledge base (instructions, notes; previous versions are kept in .history, deletions in .trash); "tmp" = scratch area, files older than 14 days are removed.`}
+		"description": `"kb" = persistent knowledge base stored in SQLite (instructions, notes; previous versions and deleted notes are kept, see kb_history); "tmp" = scratch files on disk, removed after 14 days.`}
 }
 
 func decode(raw json.RawMessage, v any) error {
-	d := json.NewDecoder(strings.NewReader(string(raw)))
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		return fmt.Errorf("invalid arguments: %w", err)
+	for try := 0; try < 16; try++ {
+		d := json.NewDecoder(strings.NewReader(string(raw)))
+		d.DisallowUnknownFields()
+		err := d.Decode(v)
+		if err == nil {
+			return nil
+		}
+		// Some clients send numbers and booleans as strings when the schema they hold is stale: coerce that field and retry.
+		var te *json.UnmarshalTypeError
+		if !errors.As(err, &te) || te.Value != "string" || te.Field == "" || strings.Contains(te.Field, ".") {
+			return fmt.Errorf("invalid arguments: %w", err)
+		}
+		var m map[string]json.RawMessage
+		if json.Unmarshal(raw, &m) != nil {
+			return fmt.Errorf("invalid arguments: %w", err)
+		}
+		var sv string
+		if json.Unmarshal(m[te.Field], &sv) != nil {
+			return fmt.Errorf("invalid arguments: %w", err)
+		}
+		sv = strings.TrimSpace(sv)
+		var probe any
+		if json.Unmarshal([]byte(sv), &probe) != nil {
+			return fmt.Errorf("invalid arguments: field %s: expected %s", te.Field, te.Type)
+		}
+		switch probe.(type) {
+		case float64, bool:
+		default:
+			return fmt.Errorf("invalid arguments: field %s: expected %s", te.Field, te.Type)
+		}
+		m[te.Field] = json.RawMessage(sv)
+		raw, _ = json.Marshal(m)
 	}
-	return nil
+	return errors.New("invalid arguments")
 }
 
-func tools() []tool {
+// legacyTools are the single-purpose tools; they stay callable by name but are not listed.
+func legacyTools() []tool {
+	return append(append(baseTools(), kbTools()...), netTools()...)
+}
+
+// tools are the listed, combined tools (fewer schemas in every request).
+func tools() []tool { return combinedTools() }
+
+func baseTools() []tool {
 	return []tool{
 		{Name: "fs_list", ReadOnly: true,
 			Description: "List files and directories under a root. Use depth to recurse (default 1).",
 			Schema: obj(map[string]any{"root": rootProp(), "path": prop("string", "relative directory, '.' for the root"),
-				"depth": prop("integer", "levels to descend, 1-6"), "include_hidden": prop("boolean", "also show .history and .trash")}, "root"),
+				"depth": prop("integer", "levels to descend, 1-6"), "include_hidden": prop("boolean", "ignored for kb")}, "root"),
 			Run: func(ctx context.Context, a *App, raw json.RawMessage) (string, map[string]any, error) {
 				var x struct {
 					Root, Path    string
@@ -273,7 +310,7 @@ func tools() []tool {
 				return s, lf, nil
 			}},
 		{Name: "fs_write",
-			Description: "Create, overwrite or append a text file. In kb the previous version is kept automatically in .history. Use kb for durable instructions, tmp for scratch files.",
+			Description: "Create, overwrite or append a text file. In kb the previous version is kept automatically (kb_history / kb_restore). Use kb for durable instructions, tmp for scratch files.",
 			Schema: obj(map[string]any{"root": rootProp(), "path": prop("string", "relative file path; parent directories are created"),
 				"content": prop("string", "UTF-8 text, max 2 MiB per call"),
 				"mode":    map[string]any{"type": "string", "enum": []string{"create", "overwrite", "append"}, "description": "create fails if the file exists"}}, "root", "path", "content", "mode"),
@@ -287,7 +324,7 @@ func tools() []tool {
 				return s, lf, err
 			}},
 		{Name: "fs_delete", Destructive: true,
-			Description: "Delete a file or an empty directory. In kb a copy is moved to .trash first.",
+			Description: "Delete a file or an empty directory. In kb a copy is kept in the trash first (kb_history kind=trash, kb_restore).",
 			Schema:      obj(map[string]any{"root": rootProp(), "path": prop("string", "relative path")}, "root", "path"),
 			Run: func(ctx context.Context, a *App, raw json.RawMessage) (string, map[string]any, error) {
 				var x struct{ Root, Path string }

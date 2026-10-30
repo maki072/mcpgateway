@@ -48,6 +48,7 @@ type authCode struct {
 type pendingAuth struct {
 	ClientID, RedirectURI, Challenge, State string
 	Exp                                     time.Time
+	Tries                                   int
 }
 
 type Store struct {
@@ -163,7 +164,7 @@ func inNets(ip net.IP, nets []*net.IPNet) bool {
 func (a *App) gate(nets []*net.IPNet, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !inNets(clientIP(r), nets) {
-			a.audit.log(map[string]any{"ev": "deny_ip", "ip": clientIP(r).String(), "path": r.URL.Path})
+			a.logDeny(clientIP(r), r.URL.Path)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -205,7 +206,7 @@ func (a *App) metaResource(w http.ResponseWriter, r *http.Request) {
 func (a *App) metaAS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"issuer":                                a.cfg.PublicURL,
-		"authorization_endpoint":                a.cfg.PublicURL + "/authorize",
+		"authorization_endpoint":                a.cfg.LoginURL + "/authorize",
 		"token_endpoint":                        a.cfg.PublicURL + "/token",
 		"registration_endpoint":                 a.cfg.PublicURL + "/register",
 		"response_types_supported":              []string{"code"},
@@ -288,10 +289,13 @@ input,button{width:100%%;padding:.7rem;margin:.4rem 0;font-size:1rem;box-sizing:
 <body><h2>Authorize access</h2><p>Client <b>%s</b> requests access to this MCP gateway.<br>Redirect host: <code>%s</code></p>%s
 <form method="post" action="/authorize"><input type="hidden" name="rid" value="%s">
 <input type="password" name="pass" placeholder="Passphrase" autocomplete="current-password" required>
-<input name="totp" placeholder="6-digit code" inputmode="numeric" autocomplete="one-time-code" required>
-<button type="submit">Authorize</button></form></body></html>`
+%s<button type="submit">Authorize</button></form>%s</body></html>`
 
-func (a *App) renderLogin(w http.ResponseWriter, status int, p *pendingAuth, rid, msg string) {
+// tsCSP is the page policy when the Turnstile widget is shown.
+const tsCSP = "default-src 'none'; style-src 'unsafe-inline'; script-src https://challenges.cloudflare.com; " +
+	"frame-src https://challenges.cloudflare.com; connect-src https://challenges.cloudflare.com; frame-ancestors 'none'"
+
+func (a *App) renderLogin(w http.ResponseWriter, r *http.Request, status int, p *pendingAuth, rid, msg string) {
 	a.st.mu.Lock()
 	cl := a.st.Clients[p.ClientID]
 	a.st.mu.Unlock()
@@ -305,9 +309,19 @@ func (a *App) renderLogin(w http.ResponseWriter, status int, p *pendingAuth, rid
 	if msg != "" {
 		msg = `<p class="e">` + html.EscapeString(msg) + `</p>`
 	}
+	ip := clientIP(r)
+	field, widget := "", ""
+	if a.needCode(ip) {
+		field = `<input name="totp" placeholder="6-digit code" inputmode="numeric" autocomplete="one-time-code" required>` + "\n"
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if !a.isTrusted(ip) && a.ts != nil {
+		w.Header().Set("Content-Security-Policy", tsCSP)
+		field += `<div class="cf-turnstile" data-sitekey="` + html.EscapeString(a.ts.siteKey) + `" data-action="` + tsAction + `" data-theme="auto"></div>` + "\n"
+		widget = `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`
+	}
 	w.WriteHeader(status)
-	fmt.Fprintf(w, loginPage, html.EscapeString(name), html.EscapeString(host), msg, html.EscapeString(rid))
+	fmt.Fprintf(w, loginPage, html.EscapeString(name), html.EscapeString(host), msg, html.EscapeString(rid), field, widget)
 }
 
 func (a *App) authorize(w http.ResponseWriter, r *http.Request) {
@@ -336,15 +350,28 @@ func (a *App) authorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "response_type=code and PKCE S256 are required", http.StatusBadRequest)
 		return
 	}
+	if !a.isTrusted(clientIP(r)) && !a.remoteReady() {
+		a.audit.log(map[string]any{"ev": "login_remote_disabled", "ip": clientIP(r).String(), "ui": false})
+		http.Error(w, "Login from this network is not enabled.", http.StatusForbidden)
+		return
+	}
 	p := &pendingAuth{ClientID: cl.ID, RedirectURI: red, Challenge: q.Get("code_challenge"), State: q.Get("state"), Exp: time.Now().Add(10 * time.Minute)}
 	rid := randToken(24)
 	a.st.mu.Lock()
-	if len(a.st.pending) > 50 {
-		a.st.pending = map[string]*pendingAuth{}
+	if len(a.st.pending) > 100 { // drop expired entries first, then everything as a last resort
+		now := time.Now()
+		for k, v := range a.st.pending {
+			if now.After(v.Exp) {
+				delete(a.st.pending, k)
+			}
+		}
+		if len(a.st.pending) > 200 {
+			a.st.pending = map[string]*pendingAuth{}
+		}
 	}
 	a.st.pending[rid] = p
 	a.st.mu.Unlock()
-	a.renderLogin(w, 200, p, rid, "")
+	a.renderLogin(w, r, 200, p, rid, "")
 }
 
 func (a *App) authorizePost(w http.ResponseWriter, r *http.Request) {
@@ -361,25 +388,25 @@ func (a *App) authorizePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request expired, start again", http.StatusBadRequest)
 		return
 	}
-	if locked, d := a.lim.locked(); locked {
-		a.audit.log(map[string]any{"ev": "login_locked", "ip": clientIP(r).String()})
-		a.renderLogin(w, 429, p, rid, fmt.Sprintf("Too many failed attempts. Try again in %d min.", int(d.Minutes())+1))
+	pass, totp, tsTok := r.PostForm.Get("pass"), r.PostForm.Get("totp"), r.PostForm.Get("cf-turnstile-response")
+	if st, msg := a.checkLogin(r.Context(), r, pass, totp, tsTok, false); st != 0 {
+		if st == 400 || st == 401 { // every failed attempt spends one of the five tries of this login request
+			a.st.mu.Lock()
+			p.Tries++
+			if p.Tries >= 5 {
+				delete(a.st.pending, rid)
+			}
+			a.st.mu.Unlock()
+		}
+		a.renderLogin(w, r, st, p, rid, msg)
 		return
 	}
-	if !a.auth.verify(r.PostForm.Get("pass"), r.PostForm.Get("totp")) {
-		a.lim.fail()
-		a.audit.log(map[string]any{"ev": "login_fail", "ip": clientIP(r).String()})
-		time.Sleep(time.Second)
-		a.renderLogin(w, 401, p, rid, "Invalid credentials.")
-		return
-	}
-	a.lim.ok()
 	code := randToken(32)
 	a.st.mu.Lock()
 	delete(a.st.pending, rid)
 	a.st.codes[sha(code)] = &authCode{ClientID: p.ClientID, RedirectURI: p.RedirectURI, Challenge: p.Challenge, Exp: time.Now().Add(codeTTL)}
 	a.st.mu.Unlock()
-	a.audit.log(map[string]any{"ev": "login_ok", "ip": clientIP(r).String(), "client": p.ClientID})
+	a.audit.log(map[string]any{"ev": "code_issued", "ip": clientIP(r).String(), "client": p.ClientID})
 	u, _ := url.Parse(p.RedirectURI)
 	qq := u.Query()
 	qq.Set("code", code)
@@ -456,3 +483,14 @@ func bearer(r *http.Request) string {
 }
 
 var _ = filepath.Join
+
+// logDeny records a blocked source at most once per 10 minutes per address, so scanners cannot flood the audit log.
+func (a *App) logDeny(ip net.IP, path string) {
+	k := ipKey(ip)
+	now := time.Now()
+	if v, ok := a.denyLog.Load(k); ok && now.Sub(v.(time.Time)) < 10*time.Minute {
+		return
+	}
+	a.denyLog.Store(k, now)
+	a.audit.log(map[string]any{"ev": "deny_ip", "ip": ip.String(), "path": path})
+}

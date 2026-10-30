@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCP gateway</title>
+<style nonce="{{NONCE}}">
+:root{--bg:#f6f7f9;--fg:#1c2330;--mut:#667085;--card:#fff;--bd:#d9dde5;--ac:#2557d6;--ac2:#e8eefc;--bad:#b42318;--ok:#067647;--code:#f0f2f6}
+@media (prefers-color-scheme:dark){:root{--bg:#10141b;--fg:#e6e9ef;--mut:#98a2b3;--card:#171c26;--bd:#2b3445;--ac:#6b93ff;--ac2:#1d2740;--bad:#ff7b72;--ok:#4cd08a;--code:#0e1219}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;padding:.6rem .9rem;background:var(--card);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:2}
+header h1{font-size:1rem;margin:0 .6rem 0 0}
+nav{display:flex;gap:.25rem;flex-wrap:wrap}
+button,select,input,textarea{font:inherit;color:inherit}
+button{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:.35rem .7rem;cursor:pointer}
+button:hover{border-color:var(--ac)}
+button.on,button.pri{background:var(--ac);border-color:var(--ac);color:#fff}
+button.dng{color:var(--bad);border-color:var(--bad)}
+button:disabled{opacity:.5;cursor:default}
+input,select,textarea{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:.4rem .55rem}
+.sp{flex:1}
+main{padding:.9rem;max-width:1200px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.8rem .9rem;margin-bottom:.9rem}
+.card h3{margin:.1rem 0 .6rem;font-size:.95rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.9rem}
+.files{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:.9rem}
+@media(max-width:760px){.files{grid-template-columns:1fr}}
+.row{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:.3rem 0}
+ul.list{list-style:none;margin:0;padding:0}
+ul.list li{padding:.3rem .5rem;border-radius:6px;cursor:pointer;display:flex;gap:.5rem;align-items:baseline;word-break:break-all}
+ul.list li:hover{background:var(--ac2)}
+ul.list li.sel{background:var(--ac2);outline:1px solid var(--ac)}
+.mut{color:var(--mut);font-size:.85em}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+textarea.ed{width:100%;min-height:52vh;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;resize:vertical;tab-size:2}
+pre{background:var(--code);border:1px solid var(--bd);border-radius:8px;padding:.6rem;overflow:auto;max-height:60vh;white-space:pre-wrap;word-break:break-word;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;margin:.3rem 0}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:.25rem .5rem;border-bottom:1px solid var(--bd);font-size:.9em;vertical-align:top}
+.bar{height:10px;background:var(--ac);border-radius:3px;min-width:2px}
+.bar.e{background:var(--bad)}
+.big{font-size:1.5rem;font-weight:600}
+.msg{padding:.45rem .7rem;border-radius:8px;margin:.5rem 0;background:var(--ac2)}
+.msg.err{background:transparent;border:1px solid var(--bad);color:var(--bad)}
+.login{max-width:22rem;margin:12vh auto}
+.login input{width:100%;margin:.3rem 0}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script nonce="{{NONCE}}">
+"use strict";
+const $app = document.getElementById("app");
+let csrf = "", root = "kb", cwd = ".", cur = null, dirty = false, tab = "files", needTotp = false;
+
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "text") e.textContent = v;
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat()) if (c != null) e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return e;
+}
+const clear = (n) => { while (n.firstChild) n.removeChild(n.firstChild); return n; };
+const fmtB = (n) => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KiB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MiB" : (n / 1073741824).toFixed(2) + " GiB";
+const fmtT = (s) => s ? s.replace("T", " ").replace(/\.\d+/, "").replace("Z", " UTC") : "";
+const fmtD = (sec) => { const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m"; };
+
+async function api(method, path, body) {
+  const opt = { method, credentials: "same-origin", headers: {} };
+  if (method !== "GET") { opt.headers["X-CSRF"] = csrf; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body || {}); }
+  const r = await fetch("/ui/api/" + path, opt);
+  let j = {};
+  try { j = await r.json(); } catch (e) { /* empty body */ }
+  if (r.status === 401 && path !== "login") { showLogin(); throw new Error("session expired"); }
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+const qs = (o) => new URLSearchParams(o).toString();
+
+function flash(host, text, err) {
+  const m = el("div", { class: "msg" + (err ? " err" : ""), text });
+  host.prepend(m);
+  setTimeout(() => m.remove(), err ? 9000 : 4000);
+}
+
+// ---------- login ----------
+let site = {};
+let tsReady = null;
+// Loads the Turnstile script once (remote sources only); the page CSP allows the Cloudflare origin.
+function loadTurnstile() {
+  if (!tsReady) tsReady = new Promise((ok, bad) => {
+    const sc = document.createElement("script");
+    sc.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    sc.nonce = document.querySelector("style").nonce || document.querySelector("style").getAttribute("nonce") || "";
+    sc.async = true; sc.onload = () => ok(window.turnstile); sc.onerror = () => bad(new Error("CAPTCHA script blocked"));
+    document.head.append(sc);
+  });
+  return tsReady;
+}
+
+function showLogin(note) {
+  clear($app);
+  if (site.remote && !site.remote_ready) {
+    $app.append(el("div", { class: "login card" }, el("h3", { text: "MCP gateway" }), el("div", { class: "msg err", text: "Вход из этой сети отключён." })));
+    return;
+  }
+  const pass = el("input", { type: "password", placeholder: "Passphrase", autocomplete: "current-password" });
+  const totp = el("input", { placeholder: "6-digit code", inputmode: "numeric", autocomplete: "one-time-code", class: needTotp ? "" : "hide" });
+  const msg = el("div");
+  const cap = el("div", { class: "cap" });
+  let tsTok = "", tsId = null;
+  if (site.sitekey) {
+    loadTurnstile().then((t) => {
+      tsId = t.render(cap, {
+        sitekey: site.sitekey, action: "login",
+        callback: (tok) => { tsTok = tok; }, "expired-callback": () => { tsTok = ""; }, "error-callback": () => { tsTok = ""; },
+      });
+    }).catch((e) => clear(msg).append(el("div", { class: "msg err", text: e.message })));
+  }
+  const go = async () => {
+    if (site.sitekey && !tsTok) { clear(msg).append(el("div", { class: "msg err", text: "Подтвердите проверку CAPTCHA" })); return; }
+    try {
+      const r = await api("POST", "login", { pass: pass.value, totp: totp.value, ts: tsTok });
+      csrf = r.csrf; pass.value = ""; totp.value = "";
+      if (tsId !== null && window.turnstile) { try { window.turnstile.remove(tsId); } catch (e) { /* widget already gone */ } }
+      start();
+    } catch (e) {
+      clear(msg).append(el("div", { class: "msg err", text: e.message }));
+      if (tsId !== null && window.turnstile) { tsTok = ""; window.turnstile.reset(tsId); } // tokens are single-use
+    }
+  };
+  pass.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  totp.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  $app.append(el("div", { class: "login card" }, el("h3", { text: "MCP gateway" }), note ? el("div", { class: "msg", text: note }) : null, pass, totp, cap, el("button", { class: "pri", onclick: go, text: "Sign in" }), msg));
+  pass.focus();
+}
+
+// ---------- shell ----------
+function start() {
+  clear($app);
+  const nav = el("nav");
+  const tabs = [["files", "Файлы"], ["search", "Поиск"], ["stats", "Статистика"], ["backups", "Бэкапы"], ["audit", "Аудит"]];
+  const view = el("main");
+  const draw = () => {
+    clear(nav);
+    for (const [id, name] of tabs) nav.append(el("button", { class: tab === id ? "on" : "", onclick: () => { if (!leave()) return; tab = id; draw(); }, text: name }));
+    clear(view);
+    ({ files: viewFiles, search: viewSearch, stats: viewStats, backups: viewBackups, audit: viewAudit })[tab](view);
+  };
+  window.go = (t) => { tab = t; draw(); };
+  $app.append(el("header", {}, el("h1", { text: "MCP gateway" }), nav, el("span", { class: "sp" }),
+    el("button", { onclick: async () => { try { await api("POST", "logout"); } catch (e) { /* ignore */ } showLogin("Signed out"); }, text: "Выйти" })), view);
+  draw();
+}
+function leave() { return !dirty || confirm("Есть несохранённые изменения. Уйти без сохранения?"); }
+window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---------- files ----------
+function viewFiles(host) {
+  const left = el("div", { class: "card" }), right = el("div", { class: "card" });
+  host.append(el("div", { class: "files" }, left, right));
+  const note = el("div"); host.prepend(note);
+
+  const rootSel = el("select", { onchange: () => { if (!leave()) { rootSel.value = root; return; } root = rootSel.value; cwd = "."; cur = null; dirty = false; loadDir(); drawEditor(); } },
+    el("option", { value: "kb", text: "kb (SQLite)" }), el("option", { value: "tmp", text: "tmp (диск)" }));
+  rootSel.value = root;
+  const crumb = el("div", { class: "mut" });
+  const list = el("ul", { class: "list" });
+  left.append(el("div", { class: "row" }, rootSel, el("button", { onclick: () => newFile(), text: "+ файл" }), el("button", { onclick: () => newDir(), text: "+ папка" }), root === "kb" ? el("button", { onclick: () => viewTrash(), text: "Корзина" }) : null), crumb, list);
+
+  const up = (p) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : ".";
+  async function loadDir() {
+    try {
+      const es = await api("GET", "list?" + qs({ root, path: cwd }));
+      crumb.textContent = root + ":" + (cwd === "." ? "/" : "/" + cwd);
+      clear(list);
+      if (cwd !== ".") list.append(el("li", { onclick: () => { cwd = up(cwd); loadDir(); } }, "⬆ ..", ));
+      es.sort((a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === "dir" ? -1 : 1));
+      for (const e of es) {
+        const name = e.path.slice(e.path.lastIndexOf("/") + 1);
+        const li = el("li", { class: cur === e.path ? "sel" : "", onclick: () => { if (e.type === "dir") { cwd = e.path; loadDir(); } else openFile(e.path); } },
+          el("span", { text: (e.type === "dir" ? "📁 " : "📄 ") + name }), e.type === "file" ? el("span", { class: "mut", text: fmtB(e.size) }) : null);
+        list.append(li);
+      }
+      if (!es.length) list.append(el("li", { class: "mut", text: "(пусто)" }));
+    } catch (e) { flash(note, e.message, true); }
+  }
+  async function openFile(p) {
+    if (!leave()) return;
+    try {
+      const r = await api("GET", "file?" + qs({ root, path: p }));
+      cur = { path: p, mtime: r.mtime, truncated: r.truncated, size: r.size, orig: r.content }; dirty = false;
+      drawEditor(r.content); loadDir();
+    } catch (e) { flash(note, e.message, true); }
+  }
+  function newFile() {
+    if (!leave()) return;
+    const n = prompt("Имя нового файла (относительно " + (cwd === "." ? "/" : cwd) + "):", "note.md");
+    if (!n) return;
+    cur = { path: cwd === "." ? n : cwd + "/" + n, mtime: "", isNew: true, orig: "" }; dirty = true;
+    drawEditor(root === "kb" && n.endsWith(".md") ? "---\ntitle: \nsummary: \ntags: []\nupdated: " + new Date().toISOString().slice(0, 10) + "\n---\n# \n" : "");
+  }
+  async function newDir() {
+    const n = prompt("Имя новой папки:"); if (!n) return;
+    try { await api("POST", "mkdir", { root, path: cwd === "." ? n : cwd + "/" + n }); flash(note, "Папка создана"); loadDir(); } catch (e) { flash(note, e.message, true); }
+  }
+  async function viewTrash() {
+    try {
+      const v = await api("GET", "versions?" + qs({ kind: "trash" }));
+      clear(right).append(el("h3", { text: "Корзина (удалённые заметки, хранятся 90 дней)" }), versionList(v, true));
+    } catch (e) { flash(note, e.message, true); }
+  }
+  function versionList(v, trash) {
+    const out = el("div"), view = el("pre", { class: "hide" }), btn = el("button", { class: "pri hide", text: "Восстановить" });
+    let sel = null;
+    if (!v.length) out.append(el("div", { class: "mut", text: "нет версий" }));
+    const ul = el("ul", { class: "list" });
+    for (const x of v) ul.append(el("li", { onclick: async () => {
+      try {
+        const r = await api("GET", "version?" + qs({ id: x.id })); sel = x;
+        view.textContent = r.content; view.classList.remove("hide"); btn.classList.remove("hide");
+        btn.textContent = trash ? "Восстановить в " + x.path : "Вернуть эту версию";
+      } catch (e) { flash(note, e.message, true); }
+    } }, el("span", { text: fmtT(x.time) }), el("span", { class: "mut", text: fmtB(x.size) + (trash ? "  " + x.path : "") })));
+    btn.addEventListener("click", async () => {
+      if (!sel || !confirm("Восстановить версию #" + sel.id + " в " + sel.path + "? Текущее содержимое сохранится в истории.")) return;
+      try { const r = await api("POST", "restore", { id: sel.id }); flash(note, r.message); await loadDir(); if (cur && cur.path === sel.path) openFile(cur.path); } catch (e) { flash(note, e.message, true); }
+    });
+    out.append(ul, view, el("div", { class: "row" }, btn));
+    return out;
+  }
+  function drawEditor(content) {
+    clear(right);
+    if (!cur) { right.append(el("div", { class: "mut", text: "Выберите файл слева или создайте новый." })); return; }
+    const ta = el("textarea", { class: "ed", spellcheck: "false" }); ta.value = content || "";
+    const st = el("span", { class: "mut" });
+    const upd = () => { st.textContent = (dirty ? "● изменено · " : "") + fmtB(new Blob([ta.value]).size) + (cur.mtime ? " · " + fmtT(cur.mtime) : ""); };
+    ta.addEventListener("input", () => { dirty = ta.value !== cur.orig; upd(); });
+    ta.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); save(); } });
+    const save = async () => {
+      if (cur.truncated) { flash(note, "Файл слишком большой для редактирования здесь", true); return; }
+      try {
+        const r = await api("PUT", "file", { root, path: cur.path, content: ta.value, mode: cur.isNew ? "create" : "overwrite", expect_mtime: cur.isNew ? "" : cur.mtime });
+        const wasNew = cur.isNew;
+        cur.mtime = r.mtime || cur.mtime; cur.orig = ta.value; cur.isNew = false; dirty = false; upd(); flash(note, r.message);
+        if (wasNew) openFile(cur.path); else loadDir();
+      } catch (e) { flash(note, e.message, true); }
+    };
+    const hist = el("div", { class: "hide" });
+    right.append(el("div", { class: "row" }, el("b", { text: cur.path }), el("span", { class: "sp" }), st),
+      ...(cur.truncated ? [el("div", { class: "msg err", text: "Файл больше 256 КиБ: показана только первая часть, сохранение отключено." })] : []),
+      ta,
+      el("div", { class: "row" },
+        el("button", { class: "pri", onclick: save, text: "Сохранить (Ctrl+S)" }),
+        el("button", { onclick: () => { if (leave()) openFile(cur.path); }, disabled: !!cur.isNew, text: "Перечитать" }),
+        el("button", { onclick: async () => {
+          const n = prompt("Новый путь:", cur.path); if (!n || n === cur.path) return;
+          if (dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
+          try { await api("POST", "move", { root, from: cur.path, to: n }); flash(note, "Перемещено"); cur = null; dirty = false; drawEditor(); loadDir(); } catch (e) { flash(note, e.message, true); }
+        }, disabled: !!cur.isNew, text: "Переименовать" }),
+        root === "kb" ? el("button", { onclick: async () => {
+          hist.classList.toggle("hide");
+          if (!hist.classList.contains("hide")) {
+            try { const v = await api("GET", "versions?" + qs({ kind: "history", path: cur.path })); clear(hist).append(el("h3", { text: "История версий" }), versionList(v, false)); } catch (e) { flash(note, e.message, true); }
+          }
+        }, disabled: !!cur.isNew, text: "История" }) : null,
+        el("button", { class: "dng", onclick: async () => {
+          if (!confirm("Удалить " + cur.path + "?" + (root === "kb" ? " Копия попадёт в корзину." : " Файл в tmp удаляется безвозвратно."))) return;
+          try { await api("DELETE", "file?" + qs({ root, path: cur.path })); flash(note, "Удалено"); cur = null; dirty = false; drawEditor(); loadDir(); } catch (e) { flash(note, e.message, true); }
+        }, disabled: !!cur.isNew, text: "Удалить" })),
+      hist);
+    upd();
+  }
+  loadDir(); drawEditor(cur ? cur.orig : undefined);
+  if (window.__open) { const p = window.__open; window.__open = null; openFile(p); }
+}
+
+// ---------- search ----------
+function viewSearch(host) {
+  const q = el("input", { placeholder: "слова через пробел", size: 28 }), tags = el("input", { placeholder: "теги (через запятую)" });
+  const logs = el("input", { type: "checkbox" }), out = el("div");
+  const open = (p) => { root = "kb"; const i = p.lastIndexOf("/"); cwd = i > 0 ? p.slice(0, i) : "."; cur = null; window.__open = p; window.go("files"); };
+  const show = (text) => {
+    clear(out); const pre = el("div", { class: "card" });
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      if (/^\s/.test(line)) pre.append(el("div", { class: "mut", text: line.trim() }));
+      else {
+        const p = line.split(" | ")[0];
+        pre.append(el("div", {}, el("a", { href: "#", onclick: (e) => { e.preventDefault(); open(p); } , text: p }), el("span", { text: line.slice(p.length) })));
+      }
+    }
+    out.append(pre);
+  };
+  const run = async () => { try { show((await api("GET", "search?" + qs({ q: q.value, tags: tags.value, logs: logs.checked ? "1" : "0", limit: "20" }))).text); } catch (e) { clear(out).append(el("div", { class: "msg err", text: e.message })); } };
+  const idx = async () => { try { show((await api("GET", "index?" + qs({ logs: logs.checked ? "1" : "0" }))).text); } catch (e) { clear(out).append(el("div", { class: "msg err", text: e.message })); } };
+  q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  host.append(el("div", { class: "card" }, el("div", { class: "row" }, q, tags, el("label", {}, logs, " журналы"), el("button", { class: "pri", onclick: run, text: "Найти" }), el("button", { onclick: idx, text: "Индекс (карта базы)" })),
+    el("div", { class: "mut", text: "Поиск по FTS5: все слова должны встречаться; слова ищутся по началу. Клик по пути покажет файл в папке." })), out);
+  q.focus();
+}
+
+// ---------- stats ----------
+function kv(rows) { const t = el("table"); for (const [k, v] of rows) t.append(el("tr", {}, el("th", { text: k }), el("td", { text: v }))); return t; }
+async function viewStats(host) {
+  const box = el("div"); host.append(box);
+  let s; try { s = await api("GET", "stats"); } catch (e) { box.append(el("div", { class: "msg err", text: e.message })); return; }
+  const k = s.kb, t = s.tmp, sv = s.server, au = s.audit || {};
+  box.append(el("div", { class: "grid" },
+    el("div", { class: "card" }, el("h3", { text: "База знаний" }), el("div", { class: "big", text: s.notes + " заметок" }),
+      kv([["файлов", k.files], ["объём текста", fmtB(k.bytes)], ["файл БД", fmtB(k.db_bytes || 0)], ["версий в истории", k.history_files], ["в корзине", k.trash_files], ["самая старая правка", fmtT(k.oldest || "")]])),
+    el("div", { class: "card" }, el("h3", { text: "tmp (диск)" }), el("div", { class: "big", text: t.files + " файлов" }), kv([["объём", fmtB(t.bytes)], ["самый старый", fmtT(t.oldest || "")]])),
+    el("div", { class: "card" }, el("h3", { text: "Сервер" }), kv([["версия", sv.version], ["аптайм", fmtD(sv.uptime_sec)], ["сертификат до", (sv.cert_expires || "?") + " (" + (sv.cert_days_left ?? "?") + " дн.)"],
+      ["диск свободно", sv.disk_total_bytes ? fmtB(sv.disk_free_bytes) + " из " + fmtB(sv.disk_total_bytes) : "?"], ["хостов SSH", sv.hosts], ["OAuth: клиенты / токены", sv.oauth_clients + " / " + sv.oauth_tokens]]))));
+
+  const dirs = el("table", {}, el("tr", {}, el("th", { text: "Раздел" }), el("th", { text: "Файлов" }), el("th", { text: "Объём" })));
+  for (const d of k.dirs || []) dirs.append(el("tr", {}, el("td", { text: d.name }), el("td", { text: d.files }), el("td", { text: fmtB(d.bytes) })));
+  const tg = el("div"); for (const x of s.tags || []) tg.append(el("span", { class: "mut", text: x.tag + "×" + x.n + "  " }));
+  const rec = el("table"); for (const r of k.recent || []) rec.append(el("tr", {}, el("td", { text: r.path }), el("td", { class: "mut", text: fmtT(r.mtime) })));
+  box.append(el("div", { class: "grid" },
+    el("div", { class: "card" }, el("h3", { text: "По разделам" }), dirs), el("div", { class: "card" }, el("h3", { text: "Теги" }), tg.childNodes.length ? tg : el("span", { class: "mut", text: "нет" })),
+    el("div", { class: "card" }, el("h3", { text: "Недавние правки" }), rec)));
+
+  if (au.error) { box.append(el("div", { class: "msg err", text: "Аудит: " + au.error })); return; }
+  const tools = el("table", {}, el("tr", {}, el("th", { text: "Инструмент" }), el("th", { text: "Вызовов" }), el("th", { text: "Ошибок" })));
+  Object.keys(au.tools || {}).sort((a, b) => au.tools[b] - au.tools[a]).forEach((n) => tools.append(el("tr", {}, el("td", { text: n }), el("td", { text: au.tools[n] }), el("td", { class: (au.tool_errors || {})[n] ? "bad" : "", text: (au.tool_errors || {})[n] || 0 }))));
+  const days = el("table"), max = Math.max(1, ...(au.days || []).map((d) => d.calls));
+  for (const d of au.days || []) {
+    const b = el("div", { class: "bar" }); b.style.width = Math.max(2, Math.round(d.calls / max * 100)) + "%";
+    days.append(el("tr", {}, el("td", { text: d.day }), el("td", { style: false }, b), el("td", { text: d.calls + (d.errors ? " (ошибок " + d.errors + ")" : "") + (d.login_fail ? ", неверных входов " + d.login_fail : "") })));
+  }
+  const ev = au.events || {};
+  const last = el("table"); for (const l of au.last_tools || []) last.append(el("tr", {}, el("td", { class: "mut", text: fmtT(l.ts) }), el("td", { text: l.tool }), el("td", { class: l.ok ? "ok" : "bad", text: l.ok ? "ok" : "ERR" }), el("td", { text: l.target || "" })));
+  box.append(el("div", { class: "grid" },
+    el("div", { class: "card" }, el("h3", { text: "Вызовы инструментов" }), tools),
+    el("div", { class: "card" }, el("h3", { text: "События безопасности" }), kv([["входов успешно", ev.login_ok || 0], ["неверных входов", ev.login_fail || 0], ["блокировок входа", ev.login_locked || 0], ["отказов по IP", ev.deny_ip || 0], ["ssh в режиме write", au.ssh_write || 0], ["правок из веб-интерфейса", ev.ui || 0], ["бэкапов", ev.backup || 0]]))),
+    el("div", { class: "card" }, el("h3", { text: "Активность по дням" }), days), el("div", { class: "card" }, el("h3", { text: "Последние вызовы" }), last));
+}
+
+// ---------- backups ----------
+async function viewBackups(host) {
+  const box = el("div"); host.append(box);
+  const load = async () => {
+    clear(box);
+    let r; try { r = await api("GET", "backups"); } catch (e) { box.append(el("div", { class: "msg err", text: e.message })); return; }
+    const t = el("table", {}, el("tr", {}, el("th", { text: "Снимок" }), el("th", { text: "Время" }), el("th", { text: "Размер" }), el("th", { text: "SHA-256" })));
+    for (const s of r.snapshots) t.append(el("tr", {}, el("td", { text: s.name }), el("td", { text: fmtT(s.time) }), el("td", { text: fmtB(s.size) }), el("td", { class: "mut", text: (s.sha256 || "").slice(0, 16) + "…" })));
+    box.append(el("div", { class: "card" }, el("h3", { text: "Снимки базы (" + r.dir + ")" }),
+      r.last_error ? el("div", { class: "msg err", text: "Последняя ошибка: " + r.last_error }) : null,
+      el("div", { class: "row" }, el("button", { class: "pri", onclick: async (ev) => { ev.target.disabled = true; try { await api("POST", "backups"); } catch (e) { alert(e.message); } load(); }, text: "Сделать бэкап сейчас" }),
+        el("span", { class: "mut", text: "Автоматически раз в сутки. Хранится: 3 последних, по одному на день за 14 дней и по одному на неделю за 8 недель. Каждый снимок проверяется (integrity_check) и имеет контрольную сумму." })),
+      r.snapshots.length ? t : el("div", { class: "mut", text: "снимков пока нет" })));
+    box.append(el("div", { class: "card" }, el("h3", { text: "Восстановление (только из консоли контейнера)" }),
+      el("pre", { text: "systemctl stop mcpgw\n/usr/local/bin/mcpgw kb-list\n/usr/local/bin/mcpgw kb-restore -file /srv/mcp/backup/<snapshot>.db -yes\nchown mcpgw:mcpgw /var/lib/mcpgw/kb.db*\nsystemctl start mcpgw" }),
+      el("div", { class: "mut", text: "Перед заменой текущая база сохраняется рядом как kb.db.before-restore-*. Читаемая копия всех заметок лежит в " + r.dir + "/export-latest/ и обновляется при каждом бэкапе." })));
+  };
+  load();
+}
+
+// ---------- audit ----------
+async function viewAudit(host) {
+  const pre = el("pre"), n = el("select", {}, ...[50, 100, 300].map((x) => el("option", { value: x, text: x })));
+  const load = async () => {
+    try {
+      const r = await api("GET", "audit?" + qs({ lines: n.value }));
+      pre.textContent = r.lines.slice().reverse().map((l) => { try { const o = JSON.parse(l); const { ts, ev, ...rest } = o; return ts.replace("T", " ").replace("Z", "") + "  " + ev + "  " + JSON.stringify(rest); } catch (e) { return l; } }).join("\n");
+    } catch (e) { pre.textContent = e.message; }
+  };
+  n.addEventListener("change", load);
+  host.append(el("div", { class: "card" }, el("div", { class: "row" }, el("b", { text: "Журнал аудита (новые сверху)" }), n, el("button", { onclick: load, text: "Обновить" })), pre));
+  load();
+}
+
+// ---------- boot ----------
+(async () => {
+  try {
+    const r = await fetch("/ui/api/session", { credentials: "same-origin" }), j = await r.json();
+    needTotp = !!j.need_totp; site = j;
+    if (j.authed) { csrf = j.csrf; start(); } else showLogin();
+  } catch (e) { showLogin("Нет связи с сервером"); }
+})();
+</script>
+</body>
+</html>

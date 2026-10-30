@@ -30,7 +30,7 @@ type AuthFile struct {
 	Salt       string `json:"salt"`
 	Hash       string `json:"hash"`
 	Iter       int    `json:"iter"`
-	TOTPSecret string `json:"totp_secret"` // base32, no padding
+	TOTPSecret string `json:"totp_secret,omitempty"` // base32, no padding; empty = passphrase only
 
 	mu       sync.Mutex
 	lastStep int64
@@ -52,7 +52,7 @@ func loadAuth(path string) (*AuthFile, error) {
 	if err := json.Unmarshal(b, &a); err != nil {
 		return nil, err
 	}
-	if a.Salt == "" || a.Hash == "" || a.TOTPSecret == "" || a.Iter < 100000 {
+	if a.Salt == "" || a.Hash == "" || a.Iter < 100000 {
 		return nil, errors.New("auth file incomplete")
 	}
 	return &a, nil
@@ -77,14 +77,20 @@ func totpAt(secret []byte, step int64) string {
 	return fmt.Sprintf("%06d", code)
 }
 
+func (a *AuthFile) needTOTP() bool { return a.TOTPSecret != "" }
+
 // verify checks passphrase and a TOTP code (+-1 step); a code can be used only once.
-func (a *AuthFile) verify(pass, code string) bool {
+// With skipTOTP the code is ignored (trusted networks only).
+func (a *AuthFile) verify(pass, code string, skipTOTP bool) bool {
 	salt, err := hex.DecodeString(a.Salt)
 	if err != nil {
 		return false
 	}
 	h, err := hashPass(pass, salt, a.Iter)
 	passOK := err == nil && subtle.ConstantTimeCompare([]byte(h), []byte(a.Hash)) == 1
+	if !a.needTOTP() || skipTOTP {
+		return passOK
+	}
 	secret, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(a.TOTPSecret)
 	if err != nil {
 		return false
@@ -110,15 +116,20 @@ func runSetup(args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	path := fs.String("auth", "/etc/mcpgw/auth.json", "auth file to write")
 	issuer := fs.String("label", "mcpgw", "label shown in the authenticator app")
+	useTOTP := fs.Bool("totp", false, "also require a TOTP code (default: passphrase only)")
 	_ = fs.Parse(args)
 	if _, err := os.Stat(*path); err == nil {
 		fmt.Fprintf(os.Stderr, "%s already exists; remove it first to re-run setup\n", *path)
 		return 1
 	}
-	p1 := readSecret("New passphrase (min 16 chars): ")
+	p1 := readSecret("New passphrase (min 20 chars, 16 with -totp): ")
 	p2 := readSecret("Repeat passphrase: ")
-	if p1 != p2 || len(p1) < 16 {
-		fmt.Fprintln(os.Stderr, "passphrases differ or are shorter than 16 characters")
+	minLen := 20
+	if *useTOTP {
+		minLen = 16
+	}
+	if p1 != p2 || len(p1) < minLen {
+		fmt.Fprintf(os.Stderr, "passphrases differ or are shorter than %d characters\n", minLen)
 		return 1
 	}
 	salt := make([]byte, 16)
@@ -131,13 +142,82 @@ func runSetup(args []string) int {
 		return 1
 	}
 	b32 := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sec)
-	a := AuthFile{Salt: hex.EncodeToString(salt), Hash: h, Iter: pbkdf2Iter, TOTPSecret: b32}
+	a := AuthFile{Salt: hex.EncodeToString(salt), Hash: h, Iter: pbkdf2Iter}
+	if *useTOTP {
+		a.TOTPSecret = b32
+	}
 	out, _ := json.MarshalIndent(&a, "", "  ")
 	if err := os.WriteFile(*path, out, 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	if !*useTOTP {
+		fmt.Printf("Saved %s (passphrase only, no TOTP)\n", *path)
+		return 0
+	}
 	fmt.Printf("Saved %s\n\nAdd this account to your authenticator app (type the key manually):\n  Key: %s\n  URI: otpauth://totp/%s?secret=%s&issuer=%s\n", *path, b32, *issuer, b32, *issuer)
+	return 0
+}
+
+// runTOTP enables (new random secret) or disables TOTP in an existing auth file.
+// The file is rewritten in place so its owner and mode stay unchanged; a copy is kept next to it.
+func runTOTP(enable bool, args []string) int {
+	name := "totp-disable"
+	if enable {
+		name = "totp-enable"
+	}
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	path := fs.String("auth", "/etc/mcpgw/auth.json", "auth file")
+	issuer := fs.String("label", "mcpgw", "label shown in the authenticator app")
+	_ = fs.Parse(args)
+	raw, err := os.ReadFile(*path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var a AuthFile
+	if err := json.Unmarshal(raw, &a); err != nil || a.Hash == "" {
+		fmt.Fprintln(os.Stderr, "auth file is not valid")
+		return 1
+	}
+	if enable && a.TOTPSecret != "" {
+		fmt.Fprintln(os.Stderr, "TOTP is already enabled; run totp-disable first to replace the key")
+		return 1
+	}
+	if !enable && a.TOTPSecret == "" {
+		fmt.Fprintln(os.Stderr, "TOTP is already disabled")
+		return 1
+	}
+	bak := *path + ".bak-" + time.Now().UTC().Format("20060102-150405")
+	if err := os.WriteFile(bak, raw, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	b32 := ""
+	if enable {
+		sec := make([]byte, 20)
+		_, _ = rand.Read(sec)
+		b32 = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sec)
+		a.TOTPSecret = b32
+	} else {
+		a.TOTPSecret = ""
+	}
+	out, _ := json.MarshalIndent(&a, "", "  ")
+	f, err := os.OpenFile(*path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err == nil {
+		_, err = f.Write(out)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "write failed:", err, "- restore from", bak)
+		return 1
+	}
+	fmt.Printf("Updated %s (previous copy: %s)\nRestart the service to apply: systemctl restart mcpgw\n", *path, bak)
+	if enable {
+		fmt.Printf("\nAdd this account to your authenticator app (type the key manually):\n  Key: %s\n  URI: otpauth://totp/%s?secret=%s&issuer=%s\n", b32, *issuer, b32, *issuer)
+	}
 	return 0
 }
 
@@ -145,16 +225,23 @@ func readSecret(prompt string) string {
 	fmt.Fprint(os.Stderr, prompt)
 	_ = exec.Command("stty", "-echo").Run()
 	defer func() { _ = exec.Command("stty", "echo").Run(); fmt.Fprintln(os.Stderr) }()
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, _ := stdinReader.ReadString('\n')
 	return strings.TrimRight(line, "\r\n")
 }
 
+// stdinReader is shared so that piped input is not swallowed by the first read.
+var stdinReader = bufio.NewReader(os.Stdin)
+
 // Limiter locks logins globally after repeated failures (there is exactly one operator).
+// Lock time escalates with every lockout and resets only after a successful login.
 type Limiter struct {
 	mu       sync.Mutex
 	fails    []time.Time
 	lockedTo time.Time
+	strikes  int
 }
+
+var lockSteps = []time.Duration{15 * time.Minute, time.Hour, 6 * time.Hour, 24 * time.Hour}
 
 func newLimiter() *Limiter { return &Limiter{} }
 
@@ -167,7 +254,8 @@ func (l *Limiter) locked() (bool, time.Duration) {
 	return false, 0
 }
 
-func (l *Limiter) fail() {
+// fail records a failed attempt; it returns true when this failure triggered a lockout.
+func (l *Limiter) fail() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
@@ -179,14 +267,22 @@ func (l *Limiter) fail() {
 	}
 	l.fails = append(keep, now)
 	if len(l.fails) >= 5 {
-		l.lockedTo = now.Add(15 * time.Minute)
+		i := l.strikes
+		if i >= len(lockSteps) {
+			i = len(lockSteps) - 1
+		}
+		l.lockedTo = now.Add(lockSteps[i])
+		l.strikes++
 		l.fails = nil
+		return true
 	}
+	return false
 }
 
 func (l *Limiter) ok() {
 	l.mu.Lock()
 	l.fails = nil
+	l.strikes = 0
 	l.mu.Unlock()
 }
 

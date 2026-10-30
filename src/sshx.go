@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	maxOut        = 64 << 10
+	maxOut        = 4 << 20  // raw capture before filtering
+	defOutBytes   = 8 << 10  // returned by default
+	maxOutBytes   = 64 << 10 // returned at most
 	defTimeout    = 60
 	maxTimeout    = 600
 	maxStdin      = 1 << 20
@@ -53,7 +55,7 @@ func (l *limitedBuf) Write(p []byte) (int, error) {
 func (l *limitedBuf) String() string {
 	s := strings.ToValidUTF8(l.buf.String(), "?")
 	if l.trunc {
-		s += "\n[output truncated at 64 KiB]"
+		s += "\n[raw output truncated at 4 MiB]"
 	}
 	return s
 }
@@ -114,6 +116,53 @@ type execArgs struct {
 	Reason         string `json:"reason"`
 	BackupNote     string `json:"backup_note"`
 	AllowDisruptiv bool   `json:"allow_disruptive"`
+	Grep           string `json:"grep"`      // keep only stdout lines matching this regexp
+	Head           int    `json:"head"`      // keep the first N lines (after grep)
+	Tail           int    `json:"tail"`      // keep the last N lines (after grep)
+	MaxBytes       int    `json:"max_bytes"` // cap of returned stdout, default 8 KiB, max 64 KiB
+}
+
+// shapeOutput applies grep/head/tail and the byte cap on the gateway side, so large outputs cost few tokens.
+func shapeOutput(s string, x execArgs) (string, error) {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	total := len(lines)
+	if s == "" {
+		lines, total = nil, 0
+	}
+	if x.Grep != "" {
+		re, err := regexp.Compile(x.Grep)
+		if err != nil {
+			return "", fmt.Errorf("grep: %v", err)
+		}
+		kept := lines[:0:0]
+		for _, l := range lines {
+			if re.MatchString(l) {
+				kept = append(kept, l)
+			}
+		}
+		lines = kept
+	}
+	if x.Head > 0 && len(lines) > x.Head {
+		lines = lines[:x.Head]
+	}
+	if x.Tail > 0 && len(lines) > x.Tail {
+		lines = lines[len(lines)-x.Tail:]
+	}
+	out := strings.Join(lines, "\n")
+	limit := x.MaxBytes
+	if limit <= 0 {
+		limit = defOutBytes
+	}
+	if limit > maxOutBytes {
+		limit = maxOutBytes
+	}
+	if len(out) > limit {
+		cut := strings.ToValidUTF8(out[:limit], "")
+		out = cut + fmt.Sprintf("\n[cut at %d bytes of %d; %d lines total — narrow with grep/head/tail or raise max_bytes]", limit, len(strings.Join(lines, "\n")), total)
+	} else if len(lines) < total {
+		out += fmt.Sprintf("\n[%d of %d lines shown]", len(lines), total)
+	}
+	return out, nil
 }
 
 // checkWrite enforces the guard-rails for state-changing operations.
@@ -138,6 +187,11 @@ func (a *App) sshExec(ctx context.Context, x execArgs) (string, error) {
 	}
 	if len(x.Stdin) > maxStdin {
 		return "", errors.New("stdin too large")
+	}
+	if x.Grep != "" {
+		if _, err := regexp.Compile(x.Grep); err != nil {
+			return "", fmt.Errorf("grep: %v", err)
+		}
 	}
 	if write {
 		if err := checkWrite(x.Reason, x.BackupNote); err != nil {
@@ -184,7 +238,18 @@ func (a *App) sshExec(ctx context.Context, x execArgs) (string, error) {
 	if cctx.Err() == context.DeadlineExceeded {
 		se.Write([]byte("\n[timeout after " + strconv.Itoa(to) + "s]"))
 	}
-	return fmt.Sprintf("exit_code: %d\n--- stdout ---\n%s\n--- stderr ---\n%s", code, so.String(), se.String()), nil
+	stdout, err := shapeOutput(so.String(), x)
+	if err != nil {
+		return "", err
+	}
+	res := fmt.Sprintf("exit %d\n%s", code, stdout)
+	if e := strings.TrimSpace(se.String()); e != "" {
+		if len(e) > 4096 {
+			e = strings.ToValidUTF8(e[len(e)-4096:], "") // the end of stderr carries the error
+		}
+		res += "\n--- stderr ---\n" + e
+	}
+	return res, nil
 }
 
 type xferArgs struct {
