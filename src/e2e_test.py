@@ -173,7 +173,7 @@ try:
     # v0.2: gateway-side pipeline in read mode (fake ssh prints its arguments)
     e, t = call("ssh_exec", {"host": "pve", "command": "cat /etc/hosts | grep -c ARGS"}); check("read pipeline: remote gets only the first command", not e and t.startswith("exit 3\n1"), t)
     e, t = call("ssh_exec", {"host": "pve", "command": "cat /etc/hosts | grep ARGS | head -1"}); check("read pipeline: filters applied", not e and "cat /etc/hosts" in t and "grep" not in t.split("\n")[1], t)
-    e, t = call("ssh_exec", {"host": "pve", "command": "cat /etc/hosts | sh"}); check("read pipeline: unknown filter rejected", e and "not allowed" in t, t)
+    e, t = call("ssh_exec", {"host": "pve", "command": "cat /etc/hosts | cut -c1-9"}); check("read pipeline: unknown filter goes to the host unchanged", not e and "| cut -c1-9" in t, t)
     e, t = call("ssh", {"op": "exec", "host": "pve", "commands": ["uptime", "hostname"]}); check("batch", not e and "### [1] uptime" in t and "### [2] hostname" in t, t)
     e, t = call("ssh", {"op": "exec", "host": "pve", "command": "echo password=Sup3rSecretVal"}); check("output masked", "Sup3rSecretVal" not in t and "password=***" in t, t)
     e, t = call("audit_tail", {"lines": 50, "full": True}); check("audit masked", "Sup3rSecretVal" not in t, t)

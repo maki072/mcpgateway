@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 // HostCfg describes one SSH target. RO credentials are used for mode=read,
 // RW credentials only for mode=write (and uploads).

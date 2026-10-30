@@ -380,19 +380,18 @@ func parseFilter(seg string) (lineFilter, error) {
 }
 
 // readPipeline splits a read-mode command into the remote part and gateway-side filters.
+// When any part is not a filter the gateway knows (cut, nl, column, unusual options, ...) the whole
+// command goes to the host unchanged and its mcp-ro-shell decides, exactly as before v0.2.
 func readPipeline(cmd string) (string, []lineFilter, error) {
 	parts, ok := splitPipe(cmd)
-	if !ok {
+	if !ok || parts[0] == "" {
 		return cmd, nil, nil
-	}
-	if parts[0] == "" {
-		return "", nil, errors.New("empty command before '|'")
 	}
 	var fs []lineFilter
 	for _, p := range parts[1:] {
 		f, err := parseFilter(p)
 		if err != nil {
-			return "", nil, err
+			return cmd, nil, nil
 		}
 		fs = append(fs, f)
 	}

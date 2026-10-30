@@ -2,6 +2,10 @@
 
 Self-hosted MCP gateway (Go, one static binary). Tools: `kb`, `fs`, `ssh`, `net`, `status`. OAuth 2.1 (DCR + PKCE), SQLite knowledge base (FTS5, version history, trash, verified snapshots), web UI, Cloudflare Turnstile for remote login, per-host read-only and read-write SSH keys, audit log.
 
+## v0.2.1 (2026-10-30)
+
+- Read-mode pipelines the gateway cannot run itself (cut, nl, column, unusual options) go to the host unchanged; its mcp-ro-shell decides, as before v0.2.0.
+
 ## v0.2.0 (2026-10-30)
 
 - `status op=audit`: compact one-line events by default, filters `host`, `tool`, `filter_op`, `errors`, `since` (`2h` or UTC time), `grep`; `full=true` for raw JSON.
@@ -15,8 +19,8 @@ Self-hosted MCP gateway (Go, one static binary). Tools: `kb`, `fs`, `ssh`, `net`
 
 | Path | What it is |
 |---|---|
-| `src/` | Go sources (v0.2.0; v4b = commit 95fddfa), `go.mod`/`go.sum`, the web UI (`ui.html`, embedded) and the end-to-end tests (`e2e_test.py`, `e2e_ui.py`, `e2e_remote.py`). |
-| `bin/mcpgw-linux-amd64` | Binary v0.2.0 as deployed in CT 105, checksum in `bin/SHA256SUMS`. |
+| `src/` | Go sources (v0.2.1; v4b = commit 95fddfa), `go.mod`/`go.sum`, the web UI (`ui.html`, embedded) and the end-to-end tests (`e2e_test.py`, `e2e_ui.py`, `e2e_remote.py`). |
+| `bin/mcpgw-linux-amd64` | Binary v0.2.1 as deployed in CT 105, checksum in `bin/SHA256SUMS`. |
 | `deploy/` | systemd units, nftables rules, LXC install script, certificate renewal, `mcp-ro-shell` (forced command for read-only SSH keys), `config.example.json`. Hostnames and LAN addresses are examples. |
 
 ## Where the sources come from
@@ -42,7 +46,7 @@ Go 1.24.7, outside a git checkout or with `-buildvcs=false` (VCS stamping change
 ```
 cd src
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../bin/mcpgw-linux-amd64 .
-sha256sum ../bin/mcpgw-linux-amd64   # v0.2.0: 323860162f74f375a1b4c5e11bf283b41df2c30e8c9665fcd00bc173b9fa5c31
+sha256sum ../bin/mcpgw-linux-amd64   # v0.2.1: db5aaf9734ecceaecb349c23aac49c09104779b509f8e1e44e5eb3af53dc415f
 ```
 
 ## Tests
@@ -53,7 +57,7 @@ go vet ./... && go test ./...
 python3 e2e_test.py ./mcpgw && python3 e2e_ui.py ./mcpgw && python3 e2e_remote.py ./mcpgw
 ```
 
-`e2e_ui.py` needs Python Playwright with Chromium. All suites pass on v0.2.0 (2026-10-30).
+`e2e_ui.py` needs Python Playwright with Chromium. All suites pass on v0.2.1 (2026-10-30).
 
 ## Secrets
 

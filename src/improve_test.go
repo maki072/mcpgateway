@@ -31,9 +31,10 @@ func TestReadPipeline(t *testing.T) {
 			t.Errorf("%q: got %q want %q err %v", c.cmd, got, c.want, err)
 		}
 	}
-	for _, bad := range []string{"cat f | sh", "cat f | grep a /etc/shadow", "cat f | grep $(id)", "cat f | tee x", "cat f | awk '{print}'", "| grep a"} {
-		if _, _, err := readPipeline(bad); err == nil {
-			t.Errorf("%q accepted", bad)
+	// unknown filters are not run on the gateway: the whole command goes to the host (its mcp-ro-shell decides)
+	for _, other := range []string{"cat f | sh", "cat f | grep a /etc/shadow", "cat f | grep $(id)", "cat f | tee x", "cat f | awk '{print}'", "| grep a", "ls | cut -c1-9"} {
+		if r, fs, err := readPipeline(other); err != nil || fs != nil || r != other {
+			t.Errorf("%q: remote %q filters %v err %v", other, r, fs != nil, err)
 		}
 	}
 	if r, fs, _ := readPipeline("a || b"); fs != nil || r != "a || b" {
