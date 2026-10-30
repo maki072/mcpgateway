@@ -128,6 +128,22 @@ func (f *FS) kbIndex(base string, includeLogs, includeDocs bool) (string, error)
 	if len(docs) == 0 {
 		return "(no notes)", nil
 	}
+	// A long document with an outline twin is listed once: the outline line, pointing at the full text.
+	have := map[string]bool{}
+	for _, d := range docs {
+		have[d.Path] = true
+	}
+	full := map[string]string{}
+	kept := docs[:0:0]
+	for _, d := range docs {
+		if strings.HasSuffix(d.Path, ".outline.md") {
+			full[d.Path] = strings.TrimSuffix(d.Path, ".outline.md") + ".md"
+		} else if strings.HasSuffix(d.Path, ".md") && have[strings.TrimSuffix(d.Path, ".md")+".outline.md"] {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	docs = kept
 	var sb strings.Builder
 	for i, d := range docs {
 		if i >= kbMaxIndex {
@@ -141,7 +157,9 @@ func (f *FS) kbIndex(base string, includeLogs, includeDocs bool) (string, error)
 		if d.Updated != "" {
 			fmt.Fprintf(&sb, " (%s)", d.Updated)
 		}
-		if d.Summary != "" {
+		if f, ok := full[d.Path]; ok && have[f] {
+			fmt.Fprintf(&sb, " — outline of %s (read it with section=)", f)
+		} else if d.Summary != "" {
 			fmt.Fprintf(&sb, " — %s", d.Summary)
 		}
 		sb.WriteString("\n")

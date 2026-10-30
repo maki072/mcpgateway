@@ -63,6 +63,7 @@ func (a *Auditor) rotateLocked() {
 }
 
 func (a *Auditor) log(m map[string]any) {
+	maskFields(m)
 	m["ts"] = time.Now().UTC().Format(time.RFC3339)
 	b, _ := json.Marshal(m)
 	a.mu.Lock()

@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -416,6 +414,15 @@ func baseTools() []tool {
 					x.Mode = "read"
 				}
 				lf := map[string]any{"host": x.Host, "mode": x.Mode, "command": x.Command, "stdin_bytes": len(x.Stdin), "reason": x.Reason, "backup_note": x.BackupNote, "disruptive_ok": x.AllowDisruptiv}
+				if len(x.Commands) > 0 {
+					lf["commands"] = strings.Join(x.Commands, " ;; ")
+				}
+				if x.Background {
+					lf["background"] = true
+				}
+				if x.LogNode != "" {
+					lf["log_node"] = x.LogNode
+				}
 				s, err := a.sshExec(ctx, x)
 				return s, lf, err
 			}},
@@ -445,34 +452,16 @@ func baseTools() []tool {
 				return s, map[string]any{"host": x.Host, "remote": x.RemotePath, "tmp": x.TmpPath, "reason": x.Reason, "backup_note": x.BackupNote}, err
 			}},
 		{Name: "audit_tail", ReadOnly: true,
-			Description: "Show the last N lines of the gateway audit log (default 50, max 300).",
-			Schema:      obj(map[string]any{"lines": prop("integer", "number of lines")}),
+			Description: "Newest audit events, one compact line each (full=true: raw JSON). Filters: host, tool, op, errors, since (2h or UTC time), grep.",
+			Schema: obj(map[string]any{"lines": prop("integer", "default 30, max 300"), "host": prop("string", "host alias"), "tool": prop("string", "tool or event name"),
+				"op": prop("string", "op"), "errors": prop("boolean", "failures only"), "since": prop("string", "90m, 2h or 2026-10-30T12:00"), "grep": prop("string", "regexp over the raw line"), "full": prop("boolean", "raw JSON lines")}),
 			Run: func(ctx context.Context, a *App, raw json.RawMessage) (string, map[string]any, error) {
-				var x struct{ Lines int }
+				var x auditQuery
 				if err := decode(raw, &x); err != nil {
 					return "", nil, err
 				}
-				if x.Lines <= 0 {
-					x.Lines = 50
-				}
-				if x.Lines > 300 {
-					x.Lines = 300
-				}
-				f, err := os.Open(a.cfg.AuditLog)
-				if err != nil {
-					return "", nil, err
-				}
-				defer f.Close()
-				var ring []string
-				sc := bufio.NewScanner(f)
-				sc.Buffer(make([]byte, 1<<20), 1<<20)
-				for sc.Scan() {
-					ring = append(ring, sc.Text())
-					if len(ring) > x.Lines {
-						ring = ring[1:]
-					}
-				}
-				return strings.Join(ring, "\n"), nil, nil
+				s, err := a.queryAudit(x)
+				return s, map[string]any{"lines": x.Lines, "filter_host": x.Host, "filter_tool": x.Tool, "errors_only": x.Errors, "since": x.Since}, err
 			}},
 		{Name: "server_status", ReadOnly: true,
 			Description: "Gateway version, uptime, TLS certificate expiry and number of registered clients/tokens.",

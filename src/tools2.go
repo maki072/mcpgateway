@@ -15,7 +15,8 @@ import (
 const instructions = "Home + hog.cx infrastructure gateway with a knowledge base. Find facts first: kb op=find (words), then read only the needed card " +
 	"(fs op=read root=kb). Long notes: fs op=toc, then op=read with section. Cards list related nodes in 'related:'. " +
 	"Rules: policies/safety.md. ssh/net: mode=read to inspect; mode=write needs reason + backup_note after a backup. " +
-	"Keep outputs small: ssh exec supports grep/head/tail/max_bytes. After a change: kb op=log on the node."
+	"Keep outputs small: ssh exec supports grep/head/tail/max_bytes, and in mode=read a trailing '| grep|head|tail|wc -l|sort|uniq' runs on the gateway. " +
+	"Several commands: commands[] in one call; long runs: background=true then op=job. After a change: kb op=log on the node (or log_node in the write call)."
 
 type opRoute struct {
 	legacy string
@@ -91,9 +92,10 @@ func combinedTools() []tool {
 	}
 
 	fsT := routeTool("fs",
-		"Files. root=kb (notes in SQLite, versions kept) or tmp (scratch, 14 days). ops: list(path,depth) read(path[,section|offset,length]) toc(path: headings with sizes) write(path,content,mode=create|overwrite|append) delete(path) move(from,to) search(query[,path]).",
+		"Files. root=kb (SQLite, versions kept) or tmp (14 days). ops: list(path,depth) read(path[,section|offset,length]) toc(path) write(path,content,mode) patch(path,old,new[,replace_all]) append_section(path,section,content) delete(path) move(from,to) search(query[,path]). Prefer patch over rewriting a card.",
 		true,
-		obj(map[string]any{"op": opProp("list", "read", "toc", "write", "delete", "move", "search"),
+		obj(map[string]any{"op": opProp("list", "read", "toc", "write", "patch", "append_section", "delete", "move", "search"),
+			"old": str("patch: exact text"), "new": str("patch: replacement"), "replace_all": flag("patch: all"),
 			"root": opProp("kb", "tmp"), "path": str("relative path"), "depth": num("list: 1-6"),
 			"section": str("read: heading text to return only that section"), "offset": num("read: byte offset"), "length": num("read: bytes"),
 			"content": str("write: text"), "mode": opProp("create", "overwrite", "append"),
@@ -101,6 +103,44 @@ func combinedTools() []tool {
 		map[string]opRoute{"list": {legacy: "fs_list"}, "read": {legacy: "fs_read"}, "write": {legacy: "fs_write"},
 			"delete": {legacy: "fs_delete"}, "move": {legacy: "fs_move"}, "search": {legacy: "fs_search"}},
 		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op == "patch" || op == "append_section" {
+				var x struct {
+					Root, Path, Old, New, Section, Content string
+					ReplaceAll                             bool `json:"replace_all"`
+				}
+				b, _ := json.Marshal(m)
+				if err := decode(b, &x); err != nil {
+					return "", nil, true, err
+				}
+				lf := map[string]any{"root": x.Root, "path": x.Path, "section": x.Section, "bytes": len(x.New) + len(x.Content)}
+				s, more, err := a.fsys.read(x.Root, x.Path, 0, maxRead)
+				if err != nil {
+					return "", lf, true, err
+				}
+				if more {
+					return "", lf, true, errors.New("file larger than 256 KiB: rewrite it with op=write instead")
+				}
+				var ns, msg string
+				if op == "patch" {
+					n := 0
+					if ns, n, err = patchText(s, x.Old, x.New, x.ReplaceAll); err != nil {
+						return "", lf, true, err
+					}
+					msg = fmt.Sprintf("patched %s:%s (%d replacement(s), %d -> %d bytes)", x.Root, x.Path, n, len(s), len(ns))
+				} else {
+					if strings.TrimSpace(x.Content) == "" {
+						return "", lf, true, errors.New("content is empty")
+					}
+					if ns, err = appendToSection(s, x.Section, x.Content); err != nil {
+						return "", lf, true, err
+					}
+					msg = fmt.Sprintf("appended %d bytes to section %q of %s:%s", len(x.Content), x.Section, x.Root, x.Path)
+				}
+				if _, err := a.fsys.write(x.Root, x.Path, ns, "overwrite"); err != nil {
+					return "", lf, true, err
+				}
+				return msg, lf, true, nil
+			}
 			_, hasSec := m["section"]
 			if op != "toc" && !(op == "read" && hasSec) {
 				return "", nil, false, nil
@@ -138,15 +178,29 @@ func combinedTools() []tool {
 			"restore": {legacy: "kb_restore"}, "log": {legacy: "kb_log"}}, nil)
 
 	sshT := routeTool("ssh",
-		"SSH to hosts from op=hosts. exec(host,command): mode=read = restricted account (one plain command, no pipes); mode=write = admin, needs reason+backup_note, disruptive commands also allow_disruptive. Output is cut to 8 KiB: use grep/head/tail/max_bytes. download(host,remote_path,tmp_path) upload(… + reason,backup_note).",
+		"SSH to op=hosts aliases. exec(host,command|commands[]): mode=read = restricted, one command per item, trailing '|grep|head|tail|wc -l|sort|uniq' runs on the gateway; mode=write = admin: reason+backup_note, log_node logs to kb, allow_disruptive if flagged. background=true -> op=job(id). Output 8 KiB, start+end kept: grep/head/tail/max_bytes. download/upload(host,remote_path,tmp_path).",
 		true,
-		obj(writeProps(map[string]any{"op": opProp("hosts", "exec", "download", "upload"),
-			"host": str("alias"), "command": str("exec: command line"), "stdin": str("exec: stdin text"), "timeout_sec": num("1-600"),
+		obj(writeProps(map[string]any{"op": opProp("hosts", "exec", "job", "download", "upload"),
+			"commands": arr("string", "exec: batch (max 20)"), "background": flag("exec: as a job"), "id": str("job id; empty lists"),
+			"log_node": str("write: kb node to log to"),
+			"host":     str("alias"), "command": str("exec: command line"), "stdin": str("exec: stdin text"), "timeout_sec": num("1-600"),
 			"allow_disruptive": flag("write: confirm disruptive"), "grep": str("exec: regexp, keep matching stdout lines"),
 			"head": num("exec: first N lines"), "tail": num("exec: last N lines"), "max_bytes": num("exec: up to 65536"),
 			"remote_path": str("download/upload: remote file"), "tmp_path": str("download/upload: file under tmp")}), "op"),
 		map[string]opRoute{"hosts": {legacy: "hosts_list", drop: []string{"mode"}}, "exec": {legacy: "ssh_exec"},
-			"download": {legacy: "ssh_download", drop: []string{"mode", "reason", "backup_note"}}, "upload": {legacy: "ssh_upload", drop: []string{"mode"}}}, nil)
+			"download": {legacy: "ssh_download", drop: []string{"mode", "reason", "backup_note"}}, "upload": {legacy: "ssh_upload", drop: []string{"mode"}}},
+		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op != "job" {
+				return "", nil, false, nil
+			}
+			var x struct{ ID string }
+			b, _ := json.Marshal(m)
+			if err := decode(b, &x); err != nil {
+				return "", nil, true, err
+			}
+			s, err := jobs.report(x.ID)
+			return s, map[string]any{"job": x.ID}, true, err
+		})
 
 	netT := routeTool("net",
 		"Network checks from the gateway to any host/port (not loopback or itself). ops: dns(name[,type]) tcp(host,port|ports[,send]) http(url[,method,headers,body]) udp(host,port,send). Payloads, non-GET http and udp need mode=write with reason+backup_note.",
@@ -162,10 +216,27 @@ func combinedTools() []tool {
 			"http": {legacy: "net_http"}, "udp": {legacy: "net_udp"}}, nil)
 
 	stT := routeTool("status",
-		"Gateway status. ops: server (version, uptime, certificate, counts) ; audit([lines]) last audit log lines.",
+		"Gateway status. ops: server; audit (compact lines; filters host, tool, filter_op, errors, since, grep; full=raw JSON).",
 		false,
-		obj(map[string]any{"op": opProp("server", "audit"), "lines": num("audit: default 50, max 300")}, "op"),
-		map[string]opRoute{"server": {legacy: "server_status", drop: []string{"lines"}}, "audit": {legacy: "audit_tail"}}, nil)
+		obj(map[string]any{"op": opProp("server", "audit"), "lines": num("default 30, max 300"), "host": str("alias"), "tool": str("tool/event"),
+			"filter_op": str("op"), "errors": flag("failures only"), "since": str("90m | 2026-10-30T12:00"), "grep": str("regexp"), "full": flag("raw JSON")}, "op"),
+		map[string]opRoute{"server": {legacy: "server_status", drop: []string{"lines", "host", "tool", "filter_op", "errors", "since", "grep", "full"}}, "audit": {legacy: "audit_tail"}},
+		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op != "audit" {
+				return "", nil, false, nil
+			}
+			if v, ok := m["filter_op"]; ok { // "op" itself selects the operation of this tool
+				m["op"] = v
+				delete(m, "filter_op")
+			}
+			var x auditQuery
+			b, _ := json.Marshal(m)
+			if err := decode(b, &x); err != nil {
+				return "", nil, true, err
+			}
+			s, err := a.queryAudit(x)
+			return s, map[string]any{"lines": x.Lines, "filter_host": x.Host, "filter_tool": x.Tool, "errors_only": x.Errors, "since": x.Since}, true, err
+		})
 	stT.ReadOnly = true
 	return []tool{kbT, fsT, sshT, netT, stT}
 }

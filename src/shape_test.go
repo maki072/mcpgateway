@@ -12,7 +12,9 @@ func TestShapeOutput(t *testing.T) {
 		{execArgs{Grep: "^a"}, "a1\na3\na5\n[3 of 5 lines shown]"},
 		{execArgs{Grep: "^a", Head: 1}, "a1\n[1 of 5 lines shown]"},
 		{execArgs{Tail: 2}, "b4\na5\n[2 of 5 lines shown]"},
-		{execArgs{MaxBytes: 4}, "a1\nb\n[cut at 4 bytes of 14; 5 lines total — narrow with grep/head/tail or raise max_bytes]"},
+		{execArgs{MaxBytes: 4}, "a1\n[… 10 bytes (4 lines) skipped …]\na5\n[cut to 4 of 14 bytes; 5 lines total — narrow with grep/head/tail or raise max_bytes]"},
+		{execArgs{MaxBytes: 4, Head: 9}, "a1\nb\n[cut to 4 of 14 bytes; 5 lines total — narrow with grep/head/tail or raise max_bytes]"},
+		{execArgs{MaxBytes: 4, Tail: 9}, "a5\n[cut to 4 of 14 bytes; 5 lines total — narrow with grep/head/tail or raise max_bytes]"},
 	}
 	for i, c := range cases {
 		got, err := shapeOutput(in, c.x)
