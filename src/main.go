@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.2.1"
+const version = "0.2.2"
 
 // HostCfg describes one SSH target. RO credentials are used for mode=read,
 // RW credentials only for mode=write (and uploads).
@@ -35,6 +35,7 @@ type HostCfg struct {
 	RWUser    string `json:"rw_user"`
 	RWKey     string `json:"rw_key"`
 	SCPLegacy bool   `json:"scp_legacy"` // pass -O to scp (RouterOS-style servers)
+	LogNode   string `json:"log_node"`   // default kb node for write-mode log entries (used when the call has no log_node)
 }
 
 type Config struct {

@@ -36,8 +36,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 sha256sum ../bin/mcpgw-linux-amd64
 ```
 
-Expected SHA-256 for v0.2.1:
-`db5aaf9734ecceaecb349c23aac49c09104779b509f8e1e44e5eb3af53dc415f`
+Expected SHA-256 for v0.2.2:
+`843bb6c076dc6998039c9c3809a72f1c14f8bd874a36298a3a89b14b97d28dcf`
 
 ## Test
 
@@ -56,9 +56,14 @@ python3 e2e_ui.py ./mcpgw      # needs Python Playwright with Chromium
 
 ### `mcp-ro-shell`
 
-A small bash forced command, not a service. It allows a fixed list of inspection commands (`ls`, `cat`, `ps`, `systemctl status`, `docker ps`, `zpool status`, ...), optionally piped into simple filters, and refuses everything else, including quoting, redirection and command chaining. It is a second lock on the host, independent of the checks in the gateway.
+A small bash forced command, not a service. It allows a fixed list of inspection commands (`ls`, `cat`, `ps`, `systemctl status`, `docker ps`, `zpool status`, ...), optionally piped into simple filters or joined with `;` (each part is checked on its own), and refuses everything else, including quoting, redirection, `&&`, `||` and substitution. It is a second lock on the host, independent of the checks in the gateway.
 
 ## Changelog
+
+### v0.2.2
+- `hosts.<alias>.log_node` in the config: a write-mode `ssh` call without `log_node` writes its log entry to that knowledge-base node.
+- Read-mode command lists (`a; b | head`) are passed to the host as they are; the filter after `;` is not applied on the gateway.
+- `mcp-ro-shell`: `;` command lists (up to 4 commands, each checked separately); `date -s` / `--set` removed.
 
 ### v0.2.1
 - Read-mode pipelines the gateway cannot run itself (`cut`, `nl`, `column`, unusual options) are passed to the host unchanged; `mcp-ro-shell` decides.

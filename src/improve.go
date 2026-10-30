@@ -85,6 +85,8 @@ func splitPipe(cmd string) (parts []string, ok bool) {
 			cur.WriteByte(c)
 			i++
 			c = cmd[i]
+		case c == ';' || c == '&':
+			return nil, false // command lists go to the host unchanged; its mcp-ro-shell checks every part
 		case c == '|':
 			if i+1 < len(cmd) && cmd[i+1] == '|' {
 				return nil, false // "||" is not a pipe; let the remote shell reject it

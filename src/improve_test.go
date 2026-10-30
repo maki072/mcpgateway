@@ -43,6 +43,15 @@ func TestReadPipeline(t *testing.T) {
 	if r, fs, _ := readPipeline(`grep "x|y" f`); fs != nil || r != `grep "x|y" f` {
 		t.Error("quoted | treated as a pipe")
 	}
+	// a command list goes to the host as it is: a trailing filter must not be applied to the last command only on the gateway
+	for _, list := range []string{"uptime; df -h | head -3", "ls; ps | grep ssh", "ls && ps | wc -l", "ls & ps | head"} {
+		if r, fs, err := readPipeline(list); err != nil || fs != nil || r != list {
+			t.Errorf("%q: remote %q filters %v err %v", list, r, fs != nil, err)
+		}
+	}
+	if r, fs, _ := readPipeline(`grep "a;b" f | head -2`); fs == nil || r != `grep "a;b" f` {
+		t.Error("quoted ; broke the pipeline split")
+	}
 }
 
 func TestMaskSecrets(t *testing.T) {

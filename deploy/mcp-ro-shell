@@ -16,13 +16,14 @@ if [[ "$cmd" =~ ^scp\ -f\ ([A-Za-z0-9_./@:+,=~-]+)$ ]]; then
   exec /usr/bin/scp -f "${BASH_REMATCH[1]}"
 fi
 
-# no quoting, expansion, redirection, chaining or substitution
-if [[ "$cmd" =~ [\;\&\`\$\>\<\(\)\{\}\\\'\"\!] ]] || [[ "$cmd" == *$'\n'* ]] || [[ "$cmd" == *$'\r'* ]]; then
+# no quoting, expansion, redirection, background/&&/|| chaining or substitution.
+# Only ';' (command list) and '|' (pipe) are allowed; every part is checked on its own below.
+if [[ "$cmd" =~ [\&\`\$\>\<\(\)\{\}\\\'\"\!] ]] || [[ "$cmd" == *$'\n'* ]] || [[ "$cmd" == *$'\r'* ]]; then
   deny "metacharacters are not allowed"
 fi
 
-IFS='|' read -r -a segs <<<"$cmd"
-[ "${#segs[@]}" -le 4 ] || deny "too many pipes"
+IFS=';' read -r -a groups <<<"$cmd"
+[ "${#groups[@]}" -le 4 ] || deny "too many commands in a list"
 
 # generic words that indicate a state change in any allowed tool
 bad_words=" rm kill stop restart start reload up down exec run prune pull build create delete destroy reboot shutdown set add remove edit apply import export flush del replace load unload vacuum rotate "
@@ -36,7 +37,7 @@ check_first() {
     ls|cat|head|tail|grep|egrep|stat|du|df|free|uptime|uname|whoami|id|lsblk|lscpu|lsmod|findmnt|ps|lsof|last|who|w|getent|file|wc|cut|sha256sum|md5sum|pveversion|lspci|lsusb|nproc|readlink|realpath|basename|dirname|ping) ;;
     sort|uniq) for x in "${w[@]:1}"; do case "$x" in -o*|--output*) deny "$c $x";; esac; done ;;
     hostname) for x in "${w[@]:1}"; do is_in "$x" -f -i -I -s -d -A --fqdn --short --domain || deny "hostname $x"; done ;;
-    date) for x in "${w[@]:1}"; do case "$x" in -s|--set*|-u|-d|--date*|-R|-I*|+*) ;; *) deny "date $x";; esac; done ;;
+    date) for x in "${w[@]:1}"; do case "$x" in -u|-d|--date*|-R|-I*|+*) ;; *) deny "date $x";; esac; done ;;
     dmesg) for x in "${w[@]:1}"; do case "$x" in -c|-C|--clear|--read-clear|-n|--console-level|-D|-E) deny "dmesg $x";; esac; done ;;
     mount|env|printenv|ifconfig) [ "${#w[@]}" -eq 1 ] || { [ "$c" = ifconfig ] && [ "$s" = -a ] && [ "${#w[@]}" -eq 2 ]; } || deny "$c takes no arguments" ;;
     ss) for x in "${w[@]:1}"; do case "$x" in -K|--kill) deny "ss $x";; esac; done ;;
@@ -80,11 +81,16 @@ check_filter() {
   esac
 }
 
-i=0
-for seg in "${segs[@]}"; do
-  seg="$(echo "$seg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [ -n "$seg" ] || deny "empty command"
-  if [ "$i" -eq 0 ]; then check_first "$seg"; else check_filter "$seg"; fi
-  i=$((i+1))
+for grp in "${groups[@]}"; do
+  IFS='|' read -r -a segs <<<"$grp"
+  [ "${#segs[@]}" -ge 1 ] || deny "empty command"
+  [ "${#segs[@]}" -le 4 ] || deny "too many pipes"
+  i=0
+  for seg in "${segs[@]}"; do
+    seg="$(echo "$seg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$seg" ] || deny "empty command"
+    if [ "$i" -eq 0 ]; then check_first "$seg"; else check_filter "$seg"; fi
+    i=$((i+1))
+  done
 done
 run "$cmd"

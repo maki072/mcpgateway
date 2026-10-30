@@ -199,6 +199,11 @@ func (a *App) sshExec(ctx context.Context, x execArgs) (string, error) {
 	if x.LogNode != "" && x.Mode != "write" {
 		return "", errors.New("log_node is for mode=write")
 	}
+	if x.Mode == "write" && x.LogNode == "" {
+		if h, herr := a.host(x.Host); herr == nil {
+			x.LogNode = h.LogNode // per-host default from the config
+		}
+	}
 	if x.Background {
 		if _, err := a.host(x.Host); err != nil {
 			return "", err
