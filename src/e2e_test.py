@@ -32,8 +32,8 @@ cfg = {"listen": f"127.0.0.1:{PORT}", "public_url": BASE, "cert_file": f"{T}/c.p
        "audit_log": f"{T}/audit.log", "known_hosts": f"{T}/kh", "ssh_bin": f"{T}/fakessh", "scp_bin": f"{T}/fakessh",
        "api_cidrs": ["127.0.0.0/8"], "login_cidrs": ["127.0.0.0/8"], "trusted_cidrs": ["127.0.0.0/8"], "trusted_skip_totp": False,
        "redirect_allow": ["https://claude.ai/api/mcp/auth_callback"], "allow_loopback": True,
-       "hosts": {"pve": {"addr": "192.0.2.1", "desc": "test", "ro_user": "mcp-ro", "ro_key": "/k/ro", "rw_user": "root", "rw_key": "/k/rw"},
-                 "ro": {"addr": "192.0.2.2", "desc": "ro only", "ro_user": "u", "ro_key": "/k/ro"}}}
+       "hosts": {"pve": {"addr": "192.0.2.1", "group": "g1", "desc": "test", "ro_user": "mcp-ro", "ro_key": "/k/ro", "rw_user": "root", "rw_key": "/k/rw"},
+                 "ro": {"addr": "192.0.2.2", "group": "g2", "desc": "ro only", "ro_user": "u", "ro_key": "/k/ro"}}}
 json.dump(cfg, open(f"{T}/config.json", "w"))
 proc = subprocess.Popen([BIN, "-config", f"{T}/config.json"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 ctx = ssl.create_default_context(cafile=f"{T}/c.pem")
@@ -178,12 +178,49 @@ try:
     e, t = call("ssh", {"op": "exec", "host": "pve", "command": "echo password=Sup3rSecretVal"}); check("output masked", "Sup3rSecretVal" not in t and "password=***" in t, t)
     e, t = call("audit_tail", {"lines": 50, "full": True}); check("audit masked", "Sup3rSecretVal" not in t, t)
     e, t = call("ssh", {"op": "exec", "host": "pve", "command": "uptime", "background": True}); check("background start", not e and "job j" in t, t)
+
     jid = t.split("job ")[1].split(" ")[0] if not e else ""
     for _ in range(30):
         e, t = call("ssh", {"op": "job", "id": jid})
         if "done in" in t or e: break
         time.sleep(0.3)
     check("background result", not e and "done in" in t and "ARGS" in t, t)
+
+    # v0.2.3: multi-host, change window, usage, one-time upload link, archive import
+    e, t = call("ssh", {"op": "exec", "hosts": ["pve", "ro"], "command": "uptime"}); check("multi-host read", not e and t.startswith("2 hosts:") and "pve" in t and "ro" in t, t)
+    e, t = call("ssh", {"op": "exec", "hosts": ["@g1"], "command": "uptime"}); check("multi-host group", not e and t.startswith("1 hosts:"), t)
+    e, t = call("ssh", {"op": "exec", "hosts": ["*"], "command": "touch /x", "mode": "write", "reason": "create marker file", "backup_note": "file did not exist before"}); check("star refused in write mode", e, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "hosts": ["ro"], "command": "uptime"}); check("host and hosts together refused", e, t)
+    e, t = call("ssh", {"op": "window", "reason": "short change series", "backup_note": "copies made on each host", "hosts": ["pve"], "minutes": 5}); check("window opens", not e and "window w-" in t, t)
+    wid = t.split("window ")[1].split()[0] if not e else ""
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "touch /x", "mode": "write", "window": wid}); check("write via window", not e and "root@192.0.2.1" in t, t)
+    e, t = call("ssh", {"op": "exec", "host": "ro", "command": "touch /x", "mode": "write", "window": wid}); check("window scope enforced", e and "outside the scope" in t, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "uptime", "window": wid}); check("window needs write mode", e, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "systemctl restart x", "mode": "write", "window": wid}); check("window does not lift disruptive check", e and "disruptive" in t, t)
+    e, t = call("ssh", {"op": "window", "id": wid, "close": True}); check("window closes", not e and "closed" in t, t)
+    e, t = call("ssh", {"op": "exec", "host": "pve", "command": "touch /x", "mode": "write", "window": wid}); check("closed window refused", e, t)
+    e, t = call("status", {"op": "usage", "since": "1h"}); check("usage report", not e and "tool calls since 1h" in t and "ssh/exec" in t, t)
+
+    import tarfile, io
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in (("n/one.md", b"# One\nhello\n"), ("n/sec.md", b"password=Sup3rSecretVal\n"), (".hidden/x.md", b"x\n")):
+            ti = tarfile.TarInfo(name); ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+    e, t = call("fs", {"op": "upload_url", "root": "tmp", "name": "in/n.tgz", "max_mb": 1}); check("upload_url", not e and "/up/" in t, t)
+    upath = "/up/" + t.split("/up/")[1].split()[0] if not e else "/up/x"
+    c = http.client.HTTPSConnection("127.0.0.1", PORT, context=ctx, timeout=30)
+    c.request("PUT", upath, buf.getvalue()); r_ = c.getresponse(); body_ = r_.read().decode()
+    check("upload stored", r_.status == 200 and "stored tmp:in/n.tgz" in body_, (r_.status, body_))
+    c = http.client.HTTPSConnection("127.0.0.1", PORT, context=ctx, timeout=30)
+    c.request("PUT", upath, b"again"); r_ = c.getresponse(); r_.read()
+    check("upload link is single-use", r_.status == 404, r_.status)
+    c = http.client.HTTPSConnection("127.0.0.1", PORT, context=ctx, timeout=30)
+    c.request("GET", upath); r_ = c.getresponse(); r_.read()
+    check("upload rejects GET", r_.status in (404, 405), r_.status)
+    e, t = call("fs", {"op": "import", "root": "tmp", "tmp_path": "in/n.tgz", "prefix": "imp"}); check("import skips secrets and hidden", not e and "imported 1 notes" in t and "1 with secrets" in t, t)
+    e, t = call("fs", {"op": "read", "root": "kb", "path": "imp/n/one.md"}); check("imported note readable", not e and "hello" in t, t)
+    e, t = call("fs", {"op": "import", "root": "tmp", "tmp_path": "in/n.tgz", "prefix": "imp", "redact": True}); check("import redact masks secret", not e and "imported 1 notes" in t and "1 existing" in t, t)
+    e, t = call("fs", {"op": "read", "root": "kb", "path": "imp/n/sec.md"}); check("redacted note has no secret", not e and "Sup3rSecretVal" not in t, t)
     e, t = call("ssh", {"op": "job"}); check("job list", jid in t, t)
     e, t = call("fs_write", {"root": "kb", "path": "projects/t/card.md", "content": "---\ntitle: T\nupdated: 2026-01-01\n---\n# T\n## A\none\n\n## B\ntwo\n", "mode": "create"})
     e, t = call("ssh", {"op": "exec", "host": "pve", "command": "touch /x", "mode": "write", "reason": "create marker file", "backup_note": "nothing to back up, test", "log_node": "projects/t"})

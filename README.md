@@ -36,8 +36,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 sha256sum ../bin/mcpgw-linux-amd64
 ```
 
-Expected SHA-256 for v0.2.2:
-`843bb6c076dc6998039c9c3809a72f1c14f8bd874a36298a3a89b14b97d28dcf`
+Expected SHA-256 for v0.2.3:
+`09a905dc237f9f9aad582520d148cc0f0ab7fe2faa386f3aa678c82efa151705`
 
 ## Test
 
@@ -59,6 +59,12 @@ python3 e2e_ui.py ./mcpgw      # needs Python Playwright with Chromium
 A small bash forced command, not a service. It allows a fixed list of inspection commands (`ls`, `cat`, `ps`, `systemctl status`, `docker ps`, `zpool status`, ...), optionally piped into simple filters or joined with `;` (each part is checked on its own), and refuses everything else, including quoting, redirection, `&&`, `||` and substitution. It is a second lock on the host, independent of the checks in the gateway.
 
 ## Changelog
+
+### v0.2.3
+- `ssh`: `hosts[]` (aliases, `@group`, `*` in read mode) runs one command or batch on several hosts in parallel; identical results are folded into one block. `hosts.<alias>.group` in the config defines groups. Write mode needs named hosts or a group and writes one log entry per kb node.
+- `ssh op=window`: reason and backup note once, then `window=<id>` on write calls (TTL up to 120 min, optional host scope; disruptive commands still need `allow_disruptive`).
+- `status op=usage`: calls and bytes per tool and host, largest answers; `in_bytes` is recorded in the audit log.
+- `fs op=upload_url`: one-time `PUT /up/<token>` link (trusted networks, up to 256 MiB) for large files; `fs op=import` unpacks a `.tgz` from tmp into the knowledge base (secret check, size limits).
 
 ### v0.2.2
 - `hosts.<alias>.log_node` in the config: a write-mode `ssh` call without `log_node` writes its log entry to that knowledge-base node.

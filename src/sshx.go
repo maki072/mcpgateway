@@ -109,6 +109,8 @@ func (a *App) hostLock(name string) *sync.Mutex {
 
 type execArgs struct {
 	Host           string   `json:"host"`
+	Hosts          []string `json:"hosts"`  // several hosts: aliases, "@group", "*" (read mode only)
+	Window         string   `json:"window"` // id of an open change window (supplies reason/backup_note)
 	Command        string   `json:"command"`
 	Mode           string   `json:"mode"` // "read" (default) or "write"
 	TimeoutSec     int      `json:"timeout_sec"`
@@ -196,6 +198,21 @@ func checkWrite(reason, backup string) error {
 
 // sshExec is the tool entry point: background jobs, batches and the optional kb log entry.
 func (a *App) sshExec(ctx context.Context, x execArgs) (string, error) {
+	if x.Window != "" {
+		if x.Mode != "write" {
+			return "", errors.New("window is for mode=write")
+		}
+		entries := x.Hosts
+		if x.Host != "" {
+			entries = []string{x.Host}
+		}
+		if err := a.windowFill(x.Window, entries, &x.Reason, &x.BackupNote); err != nil {
+			return "", err
+		}
+	}
+	if len(x.Hosts) > 0 {
+		return a.sshMulti(ctx, x)
+	}
 	if x.LogNode != "" && x.Mode != "write" {
 		return "", errors.New("log_node is for mode=write")
 	}
@@ -398,14 +415,34 @@ func (a *App) sshExecOne(ctx context.Context, x execArgs) (string, error) {
 }
 
 type xferArgs struct {
-	Host       string `json:"host"`
-	RemotePath string `json:"remote_path"`
-	TmpPath    string `json:"tmp_path"`
-	Reason     string `json:"reason"`
-	BackupNote string `json:"backup_note"`
+	Host       string   `json:"host"`
+	Hosts      []string `json:"hosts"`
+	Window     string   `json:"window"`
+	RemotePath string   `json:"remote_path"`
+	TmpPath    string   `json:"tmp_path"`
+	Reason     string   `json:"reason"`
+	BackupNote string   `json:"backup_note"`
 }
 
 func (a *App) scp(ctx context.Context, x xferArgs, upload bool) (string, error) {
+	if x.Window != "" {
+		if !upload {
+			return "", errors.New("window is for uploads")
+		}
+		entries := x.Hosts
+		if x.Host != "" {
+			entries = []string{x.Host}
+		}
+		if err := a.windowFill(x.Window, entries, &x.Reason, &x.BackupNote); err != nil {
+			return "", err
+		}
+	}
+	if len(x.Hosts) > 0 {
+		if !upload {
+			return "", errors.New("download takes a single host")
+		}
+		return a.scpMulti(ctx, x)
+	}
 	h, err := a.host(x.Host)
 	if err != nil {
 		return "", err

@@ -51,6 +51,7 @@ func (a *App) routes() http.Handler {
 	m.HandleFunc("/token", a.gate(a.apiNets, a.token))
 	m.HandleFunc("/authorize", a.gate(a.loginNets, a.authorize))
 	m.HandleFunc("/mcp", a.gate(a.apiNets, a.mcp))
+	m.HandleFunc("/up/", a.uploadPut) // one-time file intake, trusted networks only (checked inside)
 	a.uiRoutes(m)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	return secure(m)
@@ -184,6 +185,7 @@ func (a *App) callTool(r *http.Request, cid string, params json.RawMessage) (any
 		return map[string]any{"isError": true, "content": []map[string]any{{"type": "text", "text": "Error: " + err.Error()}}}, nil
 	}
 	ev["out_bytes"] = len(text)
+	ev["in_bytes"] = len(p.Arguments)
 	a.audit.log(ev)
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}, nil
 }
@@ -413,7 +415,7 @@ func baseTools() []tool {
 				if x.Mode == "" {
 					x.Mode = "read"
 				}
-				lf := map[string]any{"host": x.Host, "mode": x.Mode, "command": x.Command, "stdin_bytes": len(x.Stdin), "reason": x.Reason, "backup_note": x.BackupNote, "disruptive_ok": x.AllowDisruptiv}
+				lf := map[string]any{"host": x.Host, "hosts": strings.Join(x.Hosts, ","), "window": x.Window, "mode": x.Mode, "command": x.Command, "stdin_bytes": len(x.Stdin), "reason": x.Reason, "backup_note": x.BackupNote, "disruptive_ok": x.AllowDisruptiv}
 				if len(x.Commands) > 0 {
 					lf["commands"] = strings.Join(x.Commands, " ;; ")
 				}
@@ -449,7 +451,7 @@ func baseTools() []tool {
 					return "", nil, err
 				}
 				s, err := a.scp(ctx, x, true)
-				return s, map[string]any{"host": x.Host, "remote": x.RemotePath, "tmp": x.TmpPath, "reason": x.Reason, "backup_note": x.BackupNote}, err
+				return s, map[string]any{"host": x.Host, "hosts": strings.Join(x.Hosts, ","), "window": x.Window, "remote": x.RemotePath, "tmp": x.TmpPath, "reason": x.Reason, "backup_note": x.BackupNote}, err
 			}},
 		{Name: "audit_tail", ReadOnly: true,
 			Description: "Newest audit events, one compact line each (full=true: raw JSON). Filters: host, tool, op, errors, since (2h or UTC time), grep.",

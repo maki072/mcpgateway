@@ -16,7 +16,7 @@ const instructions = "Home + hog.cx infrastructure gateway with a knowledge base
 	"(fs op=read root=kb). Long notes: fs op=toc, then op=read with section. Cards list related nodes in 'related:'. " +
 	"Rules: policies/safety.md. ssh/net: mode=read to inspect; mode=write needs reason + backup_note after a backup. " +
 	"Keep outputs small: ssh exec supports grep/head/tail/max_bytes, and in mode=read a trailing '| grep|head|tail|wc -l|sort|uniq' runs on the gateway. " +
-	"Several commands: commands[] in one call; long runs: background=true then op=job. After a change: kb op=log on the node (or log_node in the write call)."
+	"Several hosts: hosts[] in one call. Many writes: ssh op=window once, then window=<id>. Big files: fs op=upload_url. Several commands: commands[] in one call; long runs: background=true then op=job. After a change: kb op=log on the node (or log_node in the write call)."
 
 type opRoute struct {
 	legacy string
@@ -92,9 +92,11 @@ func combinedTools() []tool {
 	}
 
 	fsT := routeTool("fs",
-		"Files. root=kb (SQLite, versions kept) or tmp (14 days). ops: list(path,depth) read(path[,section|offset,length]) toc(path) write(path,content,mode) patch(path,old,new[,replace_all]) append_section(path,section,content) delete(path) move(from,to) search(query[,path]). Prefer patch over rewriting a card.",
+		"Files. root=kb (SQLite, versions kept) or tmp (14 days). ops: upload_url(name[,max_mb]) one-time PUT link for a big file from the PC (lands in tmp) import(tmp_path[,prefix,overwrite,redact]) .tgz from tmp into kb list(path,depth) read(path[,section|offset,length]) toc(path) write(path,content,mode) patch(path,old,new[,replace_all]) append_section(path,section,content) delete(path) move(from,to) search(query[,path]). Prefer patch over rewriting a card.",
 		true,
-		obj(map[string]any{"op": opProp("list", "read", "toc", "write", "patch", "append_section", "delete", "move", "search"),
+		obj(map[string]any{"op": opProp("list", "read", "toc", "write", "patch", "append_section", "delete", "move", "search", "upload_url", "import"),
+			"name": str("upload_url: name"), "max_mb": num("upload_url: MiB"), "tmp_path": str("import: archive in tmp"),
+			"prefix": str("import: kb dir"), "overwrite": flag("import: replace"), "redact": flag("import: mask secrets"),
 			"old": str("patch: exact text"), "new": str("patch: replacement"), "replace_all": flag("patch: all"),
 			"root": opProp("kb", "tmp"), "path": str("relative path"), "depth": num("list: 1-6"),
 			"section": str("read: heading text to return only that section"), "offset": num("read: byte offset"), "length": num("read: bytes"),
@@ -103,6 +105,27 @@ func combinedTools() []tool {
 		map[string]opRoute{"list": {legacy: "fs_list"}, "read": {legacy: "fs_read"}, "write": {legacy: "fs_write"},
 			"delete": {legacy: "fs_delete"}, "move": {legacy: "fs_move"}, "search": {legacy: "fs_search"}},
 		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op == "upload_url" || op == "import" {
+				var x struct {
+					Root, Name, Prefix string
+					TmpPath            string `json:"tmp_path"`
+					MaxMB              int    `json:"max_mb"`
+					Overwrite, Redact  bool
+				}
+				b, _ := json.Marshal(m)
+				if err := decode(b, &x); err != nil {
+					return "", nil, true, err
+				}
+				if x.Root != "" && x.Root != "tmp" {
+					return "", nil, true, errors.New("root must be tmp for " + op)
+				}
+				if op == "upload_url" {
+					s, err := a.newUpload(x.Name, x.MaxMB)
+					return s, map[string]any{"path": x.Name, "max_mb": x.MaxMB}, true, err
+				}
+				s, err := a.importArchive(x.TmpPath, x.Prefix, x.Overwrite, x.Redact)
+				return s, map[string]any{"path": x.TmpPath, "prefix": x.Prefix, "overwrite": x.Overwrite}, true, err
+			}
 			if op == "patch" || op == "append_section" {
 				var x struct {
 					Root, Path, Old, New, Section, Content string
@@ -178,9 +201,10 @@ func combinedTools() []tool {
 			"restore": {legacy: "kb_restore"}, "log": {legacy: "kb_log"}}, nil)
 
 	sshT := routeTool("ssh",
-		"SSH to op=hosts aliases. exec(host,command|commands[]): mode=read = restricted, one command per item, trailing '|grep|head|tail|wc -l|sort|uniq' runs on the gateway; mode=write = admin: reason+backup_note, log_node logs to kb, allow_disruptive if flagged. background=true -> op=job(id). Output 8 KiB, start+end kept: grep/head/tail/max_bytes. download/upload(host,remote_path,tmp_path).",
+		"SSH to op=hosts aliases. exec(host|hosts[] (aliases, @group, * = all, read only; identical results are folded),command|commands[]): mode=read = restricted, one command per item, trailing '|grep|head|tail|wc -l|sort|uniq' runs on the gateway; mode=write = admin: reason+backup_note, log_node logs to kb, allow_disruptive if flagged. background=true -> op=job(id). Output 8 KiB, start+end kept: grep/head/tail/max_bytes. download/upload(host|hosts[],remote_path,tmp_path). window(reason,backup_note[,hosts,minutes] | id,close=true): opens a change window once, then pass window=<id> instead of reason/backup_note on write calls.",
 		true,
-		obj(writeProps(map[string]any{"op": opProp("hosts", "exec", "job", "download", "upload"),
+		obj(writeProps(map[string]any{"op": opProp("hosts", "exec", "job", "download", "upload", "window"),
+			"hosts": arr("string", "aliases, @group, *"), "window": str("write: window id"), "minutes": num("window: 1-120"), "close": flag("window: close id"),
 			"commands": arr("string", "exec: batch (max 20)"), "background": flag("exec: as a job"), "id": str("job id; empty lists"),
 			"log_node": str("write: kb node to log to"),
 			"host":     str("alias"), "command": str("exec: command line"), "stdin": str("exec: stdin text"), "timeout_sec": num("1-600"),
@@ -190,6 +214,27 @@ func combinedTools() []tool {
 		map[string]opRoute{"hosts": {legacy: "hosts_list", drop: []string{"mode"}}, "exec": {legacy: "ssh_exec"},
 			"download": {legacy: "ssh_download", drop: []string{"mode", "reason", "backup_note"}}, "upload": {legacy: "ssh_upload", drop: []string{"mode"}}},
 		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op == "window" {
+				var x struct {
+					Reason     string   `json:"reason"`
+					BackupNote string   `json:"backup_note"`
+					Hosts      []string `json:"hosts"`
+					Minutes    int      `json:"minutes"`
+					Close      bool     `json:"close"`
+					ID         string   `json:"id"`
+					Mode       string   `json:"mode"`
+				}
+				b, _ := json.Marshal(m)
+				if err := decode(b, &x); err != nil {
+					return "", nil, true, err
+				}
+				if x.Close {
+					s, err := closeWindow(x.ID)
+					return s, map[string]any{"window": x.ID, "close": true}, true, err
+				}
+				s, err := a.openWindow(x.Reason, x.BackupNote, x.Hosts, x.Minutes)
+				return s, map[string]any{"hosts": strings.Join(x.Hosts, ","), "minutes": x.Minutes, "reason": x.Reason, "backup_note": x.BackupNote}, true, err
+			}
 			if op != "job" {
 				return "", nil, false, nil
 			}
@@ -216,12 +261,24 @@ func combinedTools() []tool {
 			"http": {legacy: "net_http"}, "udp": {legacy: "net_udp"}}, nil)
 
 	stT := routeTool("status",
-		"Gateway status. ops: server; audit (compact lines; filters host, tool, filter_op, errors, since, grep; full=raw JSON).",
+		"Gateway status. ops: server; usage(since[,top]) — calls/bytes per tool and host; audit (compact lines; filters host, tool, filter_op, errors, since, grep; full=raw JSON).",
 		false,
-		obj(map[string]any{"op": opProp("server", "audit"), "lines": num("default 30, max 300"), "host": str("alias"), "tool": str("tool/event"),
+		obj(map[string]any{"op": opProp("server", "audit", "usage"), "top": num("usage: rows per table, default 10"), "lines": num("default 30, max 300"), "host": str("alias"), "tool": str("tool/event"),
 			"filter_op": str("op"), "errors": flag("failures only"), "since": str("90m | 2026-10-30T12:00"), "grep": str("regexp"), "full": flag("raw JSON")}, "op"),
 		map[string]opRoute{"server": {legacy: "server_status", drop: []string{"lines", "host", "tool", "filter_op", "errors", "since", "grep", "full"}}, "audit": {legacy: "audit_tail"}},
 		func(ctx context.Context, a *App, op string, m map[string]json.RawMessage) (string, map[string]any, bool, error) {
+			if op == "usage" {
+				var x struct {
+					Since string
+					Top   int
+				}
+				b, _ := json.Marshal(m)
+				if err := decode(b, &x); err != nil {
+					return "", nil, true, err
+				}
+				s, err := a.usageReport(x.Since, x.Top)
+				return s, map[string]any{"since": x.Since}, true, err
+			}
 			if op != "audit" {
 				return "", nil, false, nil
 			}
