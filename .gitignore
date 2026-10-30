@@ -1,0 +1,27 @@
+# Secrets and runtime state: never commit
+*.key
+*.pem
+*.pub
+*.crt
+*.env
+id_*
+auth.json
+config.json
+known_hosts
+keys/
+tls/
+lego/
+state.json
+*.db
+*.db-*
+audit.log
+*.bak*
+*.log
+*.pfx
+*.p12
+.env*
+# Archives and scratch
+*.tgz
+*.xz
+*.zip
+tmp/

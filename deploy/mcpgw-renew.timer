@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check for mcpgw TLS certificate renewal
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

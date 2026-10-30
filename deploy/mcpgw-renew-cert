@@ -1,0 +1,13 @@
+#!/bin/bash
+# Issue or renew the Let's Encrypt certificate via Cloudflare DNS-01 and install it for mcpgw.
+set -euo pipefail
+. /etc/mcpgw/cloudflare.env   # CLOUDFLARE_DNS_API_TOKEN=..., ACME_EMAIL=...
+export CLOUDFLARE_DNS_API_TOKEN
+D=mcp.example.com
+L="lego --accept-tos --email $ACME_EMAIL --path /etc/mcpgw/lego --dns cloudflare --dns.propagation-wait 60s --dns.resolvers 192.168.1.1:53 --domains $D"
+if [ -f /etc/mcpgw/lego/certificates/$D.crt ]; then $L renew --days 30; else $L run; fi
+install -m 0644 -o root -g mcpgw /etc/mcpgw/lego/certificates/$D.crt /etc/mcpgw/tls/fullchain.pem.new
+install -m 0640 -o root -g mcpgw /etc/mcpgw/lego/certificates/$D.key /etc/mcpgw/tls/privkey.pem.new
+mv /etc/mcpgw/tls/privkey.pem.new /etc/mcpgw/tls/privkey.pem
+mv /etc/mcpgw/tls/fullchain.pem.new /etc/mcpgw/tls/fullchain.pem
+echo "certificate installed"

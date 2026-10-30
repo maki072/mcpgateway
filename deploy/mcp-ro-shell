@@ -1,0 +1,90 @@
+#!/bin/bash
+# mcp-ro-shell: forced command for the read-only gateway SSH key.
+# Allows a fixed set of inspection commands (optionally piped into simple filters).
+# Anything else is refused. Set MCP_RO_DRYRUN=1 to print ALLOW/DENY instead of executing (tests).
+set -u
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+deny() { echo "mcp-ro-shell: denied: $1" >&2; exit 126; }
+run() { if [ "${MCP_RO_DRYRUN:-}" = 1 ]; then echo "ALLOW"; exit 0; fi; exec /bin/bash -c "$1"; }
+
+[ -n "$cmd" ] || deny "interactive shell not allowed"
+
+# scp download (legacy protocol) of a single plain path
+if [[ "$cmd" =~ ^scp\ -f\ ([A-Za-z0-9_./@:+,=~-]+)$ ]]; then
+  [[ "${BASH_REMATCH[1]}" != *..* ]] || deny "path"
+  if [ "${MCP_RO_DRYRUN:-}" = 1 ]; then echo ALLOW; exit 0; fi
+  exec /usr/bin/scp -f "${BASH_REMATCH[1]}"
+fi
+
+# no quoting, expansion, redirection, chaining or substitution
+if [[ "$cmd" =~ [\;\&\`\$\>\<\(\)\{\}\\\'\"\!] ]] || [[ "$cmd" == *$'\n'* ]] || [[ "$cmd" == *$'\r'* ]]; then
+  deny "metacharacters are not allowed"
+fi
+
+IFS='|' read -r -a segs <<<"$cmd"
+[ "${#segs[@]}" -le 4 ] || deny "too many pipes"
+
+# generic words that indicate a state change in any allowed tool
+bad_words=" rm kill stop restart start reload up down exec run prune pull build create delete destroy reboot shutdown set add remove edit apply import export flush del replace load unload vacuum rotate "
+
+is_in() { local n="$1"; shift; local x; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
+
+check_first() {
+  local -a w=($1)
+  local c="${w[0]:-}" s="${w[1]:-}"
+  case "$c" in
+    ls|cat|head|tail|grep|egrep|stat|du|df|free|uptime|uname|whoami|id|lsblk|lscpu|lsmod|findmnt|ps|lsof|last|who|w|getent|file|wc|cut|sha256sum|md5sum|pveversion|lspci|lsusb|nproc|readlink|realpath|basename|dirname|ping) ;;
+    sort|uniq) for x in "${w[@]:1}"; do case "$x" in -o*|--output*) deny "$c $x";; esac; done ;;
+    hostname) for x in "${w[@]:1}"; do is_in "$x" -f -i -I -s -d -A --fqdn --short --domain || deny "hostname $x"; done ;;
+    date) for x in "${w[@]:1}"; do case "$x" in -s|--set*|-u|-d|--date*|-R|-I*|+*) ;; *) deny "date $x";; esac; done ;;
+    dmesg) for x in "${w[@]:1}"; do case "$x" in -c|-C|--clear|--read-clear|-n|--console-level|-D|-E) deny "dmesg $x";; esac; done ;;
+    mount|env|printenv|ifconfig) [ "${#w[@]}" -eq 1 ] || { [ "$c" = ifconfig ] && [ "$s" = -a ] && [ "${#w[@]}" -eq 2 ]; } || deny "$c takes no arguments" ;;
+    ss) for x in "${w[@]:1}"; do case "$x" in -K|--kill) deny "ss $x";; esac; done ;;
+    sensors) ;;
+    smartctl) for x in "${w[@]:1}"; do case "$x" in -s|--set*|-t|--test*|-X|--abort|-C|--captive|-o|-S) deny "smartctl $x";; esac; done ;;
+    tree) for x in "${w[@]:1}"; do case "$x" in -o|--output*) deny "tree $x";; esac; done ;;
+    find) for x in "${w[@]}"; do case "$x" in -exec|-execdir|-ok|-okdir|-delete|-fprint*|-fls) deny "find $x";; esac; done ;;
+    ip) is_in "${s#-}" a addr address r route l link n neigh br s show brief 4 6 o d || deny "ip $s"
+        for x in "${w[@]:1}"; do is_in "$x" add del delete set flush change replace append "-batch" "-force" && deny "ip $x"; done ;;
+    journalctl) for x in "${w[@]}"; do case "$x" in --vacuum*|--rotate|--flush|--sync|--relinquish-var|--smart-relinquish-var|--setup-keys|--update-catalog|--verify) deny "journalctl $x";; esac; done ;;
+    systemctl) is_in "$s" status list-units list-unit-files is-active is-enabled is-failed show list-timers list-sockets cat || deny "systemctl $s" ;;
+    pct) is_in "$s" list status config df || deny "pct $s" ;;
+    qm)  is_in "$s" list status config || deny "qm $s" ;;
+    pvesh) [ "$s" = get ] || deny "pvesh $s" ;;
+    pvesm) is_in "$s" status list || deny "pvesm $s" ;;
+    zpool) is_in "$s" status list get iostat history || deny "zpool $s" ;;
+    zfs) is_in "$s" list get || deny "zfs $s" ;;
+    docker)
+      case "$s" in
+        ps|logs|inspect|images|version|info|stats|top) ;;
+        compose|network|volume) [[ " ${w[*]} " =~ \ (ps|logs|config|ls|inspect|images|top|version)\  ]] || deny "docker $s" ;;
+        *) deny "docker $s" ;;
+      esac
+      for x in "${w[@]:1}"; do case "$bad_words" in *" $x "*) deny "docker word $x";; esac; done ;;
+    nft) [ "$s" = list ] || deny "nft $s" ;;
+    iptables|ip6tables) is_in "$s" -L -S -nL -n -v -t || deny "iptables $s"
+        for x in "${w[@]:1}"; do case "$x" in -F|-X|-A|-D|-I|-R|-P|-Z|-N|-E) deny "iptables $x";; esac; done ;;
+    apt|apt-get) [ "$s" = list ] || deny "apt $s" ;;
+    apt-cache|dpkg|dpkg-query) for x in "${w[@]:1}"; do case "$x" in -i|--install|-r|--remove|-P|--purge|--configure) deny "dpkg $x";; esac; done ;;
+    crontab) [ "$s" = -l ] || deny "crontab $s" ;;
+    *) deny "command not in allow-list: ${c:-empty}" ;;
+  esac
+}
+
+check_filter() {
+  local -a w=($1); local c="${w[0]:-}"
+  is_in "$c" grep egrep head tail wc sort uniq cut nl column || deny "pipe target not allowed: $c"
+  case "$c" in
+    sort) for x in "${w[@]:1}"; do case "$x" in -o*|--output*) deny "sort $x";; esac; done ;;
+    uniq) local n=0 x; for x in "${w[@]:1}"; do [[ "$x" == -* ]] || n=$((n+1)); done; [ "$n" -le 0 ] || deny "uniq operands" ;;
+  esac
+}
+
+i=0
+for seg in "${segs[@]}"; do
+  seg="$(echo "$seg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$seg" ] || deny "empty command"
+  if [ "$i" -eq 0 ]; then check_first "$seg"; else check_filter "$seg"; fi
+  i=$((i+1))
+done
+run "$cmd"

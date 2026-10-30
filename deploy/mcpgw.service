@@ -1,0 +1,32 @@
+[Unit]
+Description=MCP gateway (mcpgw)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mcpgw
+Group=mcpgw
+ExecStart=/usr/local/bin/mcpgw -config /etc/mcpgw/config.json
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/srv/mcp /var/lib/mcpgw /var/log/mcpgw
+ReadOnlyPaths=/etc/mcpgw
+
+[Install]
+WantedBy=multi-user.target
